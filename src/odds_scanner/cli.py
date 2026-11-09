@@ -23,6 +23,7 @@ from odds_scanner.client import (
 )
 from odds_scanner.config import DEFAULT_ENV_FILE, ConfigError, load_settings
 from odds_scanner.doctor import run_checks
+from odds_scanner.ledger_cli import ledger_app
 from odds_scanner.math import best_market_margin
 from odds_scanner.normalize import normalize_events
 from odds_scanner.rank import (
@@ -38,6 +39,7 @@ DATA_DIR = Path("data")
 FIXTURES_DIR = Path("fixtures")
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Escáner de cuotas.")
+app.add_typer(ledger_app, name="ledger")
 
 
 @app.command()
