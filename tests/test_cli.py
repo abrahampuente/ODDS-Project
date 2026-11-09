@@ -136,3 +136,77 @@ def test_sports_with_invalid_key_fails_clearly(workdir: Path) -> None:
         result = runner.invoke(app, ["sports"])
     assert result.exit_code == 1
     assert "ODDS_API_KEY" in result.output
+
+
+# --- rank (fase 4) ------------------------------------------------------------
+
+
+def test_rank_from_real_fixture_prints_top_15() -> None:
+    result = runner.invoke(
+        app, ["rank", "--from-fixture", str(FIXTURES / "soccer_epl_2026-11-09.json")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "Top 15" in result.output
+    assert "Descartadas: 27 (lay_market=27)" in result.output
+    assert result.output.count("h2h") >= 15
+
+
+def test_rank_warns_on_arbitrage() -> None:
+    result = runner.invoke(
+        app, ["rank", "--from-fixture", str(FIXTURES / "synthetic_arbitrage.json")]
+    )
+    assert result.exit_code == 0, result.output
+    table_rows = [line for line in result.output.splitlines() if "Jugador A - Jugador B" in line]
+    assert len(table_rows) == 2
+    assert all(line.rstrip().endswith("ARB") for line in table_rows)  # marca en la fila
+    assert "desactualizada" in result.output
+
+
+def test_rank_table_fits_120_columns() -> None:
+    result = runner.invoke(
+        app, ["rank", "--from-fixture", str(FIXTURES / "soccer_epl_2026-11-09.json")]
+    )
+    rows = [line for line in result.output.splitlines() if " h2h " in line]
+    assert len(rows) == 15
+    assert all(len(line.rstrip()) <= 120 for line in rows)
+    assert all(line.rstrip().endswith("ARB") for line in rows[:3])  # Chelsea-Leeds
+
+
+def test_rank_applies_odds_filter() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "rank",
+            "--from-fixture",
+            str(FIXTURES / "synthetic_arbitrage.json"),
+            "--min-odds",
+            "2.15",
+            "--max-odds",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Jugador A" in result.output and "casa_uno" in result.output
+    assert "casa_dos" not in result.output
+
+
+def test_rank_missing_fixture_fails() -> None:
+    result = runner.invoke(app, ["rank", "--from-fixture", "no/existe.json"])
+    assert result.exit_code == 1
+    assert "no existe" in result.output
+
+
+def test_rank_invalid_filters_fail() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "rank",
+            "--from-fixture",
+            str(FIXTURES / "synthetic_arbitrage.json"),
+            "--min-odds",
+            "5",
+            "--max-odds",
+            "4",
+        ],
+    )
+    assert result.exit_code == 1

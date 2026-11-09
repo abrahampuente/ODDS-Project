@@ -1,0 +1,28 @@
+[
+  {
+    "id": "synthetic-arb-tennis-001",
+    "sport_key": "tennis_atp_synthetic",
+    "sport_title": "ATP (sintético)",
+    "commence_time": "2026-11-20T18:00:00Z",
+    "home_team": "Jugador A",
+    "away_team": "Jugador B",
+    "bookmakers": [
+      {
+        "key": "casa_uno",
+        "title": "Casa Uno",
+        "markets": [
+          {"key": "h2h", "last_update": "2026-11-19T10:00:00Z",
+           "outcomes": [{"name": "Jugador A", "price": 2.20}, {"name": "Jugador B", "price": 1.70}]}
+        ]
+      },
+      {
+        "key": "casa_dos",
+        "title": "Casa Dos",
+        "markets": [
+          {"key": "h2h", "last_update": "2026-11-19T10:05:00Z",
+           "outcomes": [{"name": "Jugador A", "price": 1.80}, {"name": "Jugador B", "price": 2.10}]}
+        ]
+      }
+    ]
+  }
+]

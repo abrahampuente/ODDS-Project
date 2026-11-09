@@ -1,10 +1,13 @@
 """Interfaz de línea de comandos."""
 
+import json
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
+from rich import box
 from rich.console import Console
 from rich.table import Table
 
@@ -20,6 +23,8 @@ from odds_scanner.client import (
 from odds_scanner.config import DEFAULT_ENV_FILE, ConfigError, load_settings
 from odds_scanner.doctor import run_checks
 from odds_scanner.math import best_market_margin
+from odds_scanner.normalize import normalize_events
+from odds_scanner.rank import ARBITRAGE_WARNING, RankFilters, rank, summarize_markets
 
 DATA_DIR = Path("data")
 FIXTURES_DIR = Path("fixtures")
@@ -159,3 +164,105 @@ def fetch(
         if client.last_record_path is not None:
             console.print(f"Grabado: {client.last_record_path}")
         console.print(_quota_line("Cuota después", read_quota(client.data_dir)))
+
+
+# --- rank (fase 4) ------------------------------------------------------------
+
+
+def _load_fixture_events(path: Path) -> list[Event]:
+    if not path.is_file():
+        raise _fail(f"{path} no existe")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return [Event.model_validate(item) for item in raw]
+    except (ValueError, TypeError) as exc:
+        raise _fail(f"{path} no es una fixture de cuotas válida: {type(exc).__name__}") from None
+
+
+def _split(value: str | None) -> set[str] | None:
+    return {v.strip() for v in value.split(",") if v.strip()} if value else None
+
+
+@app.command(name="rank")
+def rank_cmd(
+    from_fixture: Annotated[
+        Path, typer.Option("--from-fixture", help="JSON grabado con --record (no gasta cuota).")
+    ],
+    sport: Annotated[str | None, typer.Option(help="Deportes separados por coma.")] = None,
+    market: Annotated[str | None, typer.Option(help="Mercados separados por coma.")] = None,
+    within_hours: Annotated[
+        float | None, typer.Option(help="Solo eventos que empiezan dentro de N horas.")
+    ] = None,
+    min_odds: Annotated[float | None, typer.Option(help="Mejor cuota mínima.")] = None,
+    max_odds: Annotated[float | None, typer.Option(help="Mejor cuota máxima.")] = None,
+    top: Annotated[int, typer.Option(min=1, help="Filas a mostrar.")] = 15,
+) -> None:
+    """Rankea resultados por margen combinado (menor = mejor) desde una fixture."""
+    console = _console()
+    events = _load_fixture_events(from_fixture)
+    try:
+        filters = RankFilters(
+            sports=_split(sport),
+            markets=_split(market),
+            within_hours=within_hours,
+            min_odds=min_odds,
+            max_odds=max_odds,
+        )
+    except ValueError as exc:
+        raise _fail(str(exc)) from None
+    normalized = normalize_events(events)
+    summaries = summarize_markets(normalized.rows)
+    ranked = rank(summaries, filters, now=datetime.now(UTC))
+    reasons = ", ".join(f"{k}={v}" for k, v in sorted(normalized.discarded.items()))
+    console.print(
+        f"Eventos: {len(events)} | filas válidas: {len(normalized.rows)} | "
+        f"mercados: {len(summaries)} | resultados tras filtros: {len(ranked)}"
+    )
+    console.print(
+        f"Descartadas: {normalized.discarded_total}" + (f" ({reasons})" if reasons else "")
+    )
+
+    shown = ranked[:top]
+    table = Table(
+        title=f"Top {len(shown)} por margen combinado",
+        box=box.SIMPLE_HEAD,
+        show_edge=False,
+        pad_edge=False,
+    )
+    # (nombre, ancho mínimo, ancho máximo, alineación): suma 119 columnas con separadores.
+    columns: list[tuple[str, int, int, Literal["left", "right"]]] = [
+        ("#", 2, 3, "right"),
+        ("inicio CL", 11, 11, "left"),
+        ("evento", 10, 22, "left"),
+        ("mercado", 7, 8, "left"),
+        ("resultado", 8, 15, "left"),
+        ("cuota", 5, 6, "right"),
+        ("casa", 8, 12, "left"),
+        ("m. casa", 7, 7, "right"),
+        ("m. comb.", 11, 11, "right"),
+    ]
+    for name, min_w, max_w, justify in columns:
+        table.add_column(
+            name,
+            min_width=min_w,
+            max_width=max_w,
+            no_wrap=True,
+            overflow="ellipsis",
+            justify=justify,
+        )
+    for i, r in enumerate(shown, start=1):
+        market_label = r.market if r.line is None else f"{r.market} {r.line:g}"
+        table.add_row(
+            str(i),
+            r.commence_time_cl.strftime("%d-%m %H:%M"),
+            f"{r.home} - {r.away}",
+            market_label,
+            r.outcome if r.point is None else f"{r.outcome} {r.point:+g}",
+            f"{r.best_price:.2f}",
+            r.bookmaker,
+            f"{r.book_margin:+.2%}",
+            f"{r.best_market_margin:+.2%}" + (" ARB" if r.is_arbitrage else "    "),
+        )
+    console.print(table)
+    if any(r.is_arbitrage for r in shown):
+        console.print(f"ADVERTENCIA (ARB): {ARBITRAGE_WARNING}")
