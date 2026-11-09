@@ -203,12 +203,12 @@ def bet(
         line, fair_prob = r.line, r.fair_prob
     else:
         missing = [flag for flag, value in manual.items() if value is None]
-        if missing:
+        if missing or odds is None:
             raise _fail(f"faltan {', '.join(missing)} (o usa --row N con una fila del ranking)")
-        assert odds is not None
         book_margin = _parse_market_odds(market_odds, odds) if market_odds else None
         source = "manual"
-    assert odds is not None and event and market and selection and bookmaker
+    if odds is None or not (event and market and selection and bookmaker):
+        raise _fail("datos de la apuesta incompletos: evento, mercado, selección y casa")
 
     with Ledger(_db(ctx, db)) as ledger:
         try:

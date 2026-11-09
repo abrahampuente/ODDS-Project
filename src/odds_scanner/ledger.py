@@ -226,12 +226,15 @@ class Ledger:
         for version, sql in MIGRATIONS:  # global: se lee en cada apertura
             if version <= current:
                 continue
-            script = (
-                f"BEGIN;\n{sql}\nINSERT INTO schema_version (version, applied_at) "
-                f"VALUES ({version}, '{self._now()}');\nCOMMIT;"
-            )
+            # El DDL y el registro de versión van en una sola transacción: o se aplica
+            # todo o nada. La versión se inserta con parámetros (sin armar SQL a mano).
             try:
-                self._conn.executescript(script)
+                self._conn.executescript("BEGIN;\n" + sql)
+                self._conn.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (version, self._now()),
+                )
+                self._conn.commit()
             except sqlite3.Error:
                 self._conn.rollback()
                 raise

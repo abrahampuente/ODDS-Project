@@ -11,7 +11,7 @@ endif
 
 SRC := src tests
 
-.PHONY: install lint typecheck test check
+.PHONY: install lint typecheck test check security
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -29,3 +29,9 @@ test:
 	$(VPY) -m pytest --cov=odds_scanner --cov-report=term-missing --cov-fail-under=85
 
 check: lint typecheck test
+
+# pip-audit: vulnerabilidades conocidas en dependencias instaladas (excluye el propio paquete).
+# bandit: análisis estático; falla solo con severidad media o alta (-ll).
+security:
+	$(VPY) -m pip_audit --skip-editable
+	$(VPY) -m bandit -r src -ll

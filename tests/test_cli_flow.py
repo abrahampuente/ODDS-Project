@@ -487,3 +487,34 @@ def test_report_shows_clv_from_capture(flow: Path) -> None:
     assert code == 0, out
     assert "CLV promedio: +0.00% (1 apuestas)" in out
     assert "#1: tomada 1.94 vs cierre 1.94" in out
+
+
+def test_manual_bet_rejects_empty_text_fields(flow: Path) -> None:
+    code, out = invoke(
+        "bet",
+        "--pot",
+        "1",
+        "--stake",
+        "100",
+        "--odds",
+        "2",
+        "--event",
+        "",
+        "--market",
+        "h2h",
+        "--selection",
+        "X",
+        "--bookmaker",
+        "casa",
+        "--yes",
+    )
+    assert code == 1 and "incompletos" in out
+
+
+def test_read_only_commands_do_not_create_ledger(workdir: Path) -> None:
+    db = workdir / "data" / "ledger.db"
+    code, out = invoke("export", "--format", "csv")
+    assert code == 0 and "no existe" in out
+    code, out = invoke("report")
+    assert code == 1 and "init" in out
+    assert not db.exists()

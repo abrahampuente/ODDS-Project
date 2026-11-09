@@ -1,5 +1,6 @@
 """Chequeos de entorno para `odds-scanner doctor`. Nunca muestran la API key."""
 
+import os
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -30,9 +31,11 @@ def check_python(version: tuple[int, ...] = tuple(sys.version_info[:3])) -> Chec
 
 
 def check_env_file(env_file: Path) -> CheckResult:
-    """Verifica que exista el archivo .env."""
+    """Verifica que exista .env, o que la key venga del entorno (p. ej. en Docker)."""
     if env_file.is_file():
         return CheckResult(".env", True, f"encontrado ({env_file})")
+    if os.environ.get("ODDS_API_KEY", "").strip():
+        return CheckResult(".env", True, "no existe; se usa ODDS_API_KEY del entorno")
     return CheckResult(".env", False, f"no existe {env_file}; copia .env.example a .env")
 
 

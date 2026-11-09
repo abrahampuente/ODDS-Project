@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check + seguridad
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar
+        run: make install
+      - name: make check (ruff + mypy --strict + pytest, sin red)
+        run: make check
+      - name: Seguridad (pip-audit + bandit)
+        run: make security
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build --tag odds-scanner:ci .
+      - name: Humo de la imagen (sin red ni key)
+        run: |
+          docker run --rm odds-scanner:ci version
+          docker run --rm --user 10001 odds-scanner:ci --help

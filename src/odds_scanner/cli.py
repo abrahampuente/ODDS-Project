@@ -1,8 +1,11 @@
 """Interfaz de línea de comandos."""
 
 import json
+import subprocess  # nosec B404 - solo para relanzar odds-scanner
+import sys
+import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -27,7 +30,7 @@ from odds_scanner.export import build_sheets, export_csv, export_xlsx
 from odds_scanner.ledger import DEFAULT_DB, Ledger
 from odds_scanner.ledger_cli import LEDGER_COMMANDS, ledger_app
 from odds_scanner.math import best_market_margin
-from odds_scanner.normalize import normalize_events
+from odds_scanner.normalize import CHILE_TZ, normalize_events
 from odds_scanner.rank import (
     ARBITRAGE_WARNING,
     RankedOutcome,
@@ -36,6 +39,13 @@ from odds_scanner.rank import (
     summarize_markets,
 )
 from odds_scanner.report import build_report, format_report
+from odds_scanner.scheduler import (
+    QUOTA_INSUFFICIENT,
+    ScanJob,
+    parse_times,
+    run_forever,
+    run_once,
+)
 from odds_scanner.store import (
     closing_best_price,
     latest_capture,
@@ -504,8 +514,13 @@ def export_cmd(
     last = load_last_rank(DATA_DIR)
     if last is None:
         console.print("Aviso: sin ranking guardado; la hoja ranking queda vacía.")
-    with Ledger(db) as ledger:
-        sheets = build_sheets(last.rows if last else [], ledger.bets(), ledger.pots())
+    if db.is_file():
+        with Ledger(db) as ledger:
+            bets, pots = ledger.bets(), ledger.pots()
+    else:  # leer no debe crear la base
+        console.print(f"Aviso: no existe {db}; las hojas apuestas y pozos quedan vacías.")
+        bets, pots = [], []
+    sheets = build_sheets(last.rows if last else [], bets, pots)
     stamp = timeutil.utcnow().strftime("%Y%m%dT%H%M%SZ")
     if fmt is ExportFormat.xlsx:
         target = out or DATA_DIR / "exports" / f"export_{stamp}.xlsx"
@@ -521,6 +536,8 @@ def export_cmd(
 @app.command()
 def report(db: Annotated[Path, typer.Option(help="Base del ledger.")] = DEFAULT_DB) -> None:
     """Resumen en texto: saldos, distancia a 500.000, ganadas/perdidas, ROI, margen y CLV."""
+    if not db.is_file():  # leer no debe crear la base
+        raise _fail(f"no existe {db}: ejecuta `init` para crear los pozos")
     with Ledger(db) as ledger:
         state, bets = ledger.state(), ledger.bets()
     captures = list_captures(DATA_DIR)
@@ -539,6 +556,140 @@ def report(db: Annotated[Path, typer.Option(help="Base del ledger.")] = DEFAULT_
         if price is not None:
             closing[b.id] = price
     typer.echo(format_report(build_report(state, bets, closing)))
+
+
+# --- operación: quota / pipeline / schedule (fase 8) ---------------------------
+
+
+@app.command()
+def quota(
+    refresh: Annotated[
+        bool, typer.Option("--refresh", help="Actualiza con /sports, que no consume cuota.")
+    ] = False,
+    need: Annotated[
+        int | None,
+        typer.Option(
+            min=0, help="Sale con código 2 si tras gastar N quedaría menos que la reserva."
+        ),
+    ] = None,
+) -> None:
+    """Muestra la cuota de la API y verifica si alcanza para una corrida."""
+    console = _console()
+    reserve = load_settings().min_quota_reserve
+    if refresh:
+        with _make_client() as client:
+            try:
+                client.list_sports()
+            except OddsApiError as exc:
+                raise _fail(str(exc)) from None
+    status = read_quota(DATA_DIR)
+    console.print(_quota_line("Cuota", status) + f" | reserva mínima {reserve}")
+    if need is None:
+        return
+    if status is None:
+        console.print("Cuota desconocida: usa --refresh (gratis) para leerla.")
+        raise typer.Exit(code=QUOTA_INSUFFICIENT)
+    after = status.remaining - need
+    if after < reserve:
+        console.print(f"reserva insuficiente: quedarían {after} consultas < reserva {reserve}")
+        raise typer.Exit(code=QUOTA_INSUFFICIENT)
+    console.print(f"alcanza: quedarían {after} consultas (reserva {reserve})")
+
+
+def _run_subcommand(command: list[str]) -> int:
+    """Ejecuta `odds-scanner <command>` en un proceso hijo (la salida va a la consola)."""
+    completed = subprocess.run(  # nosec B603 - argumentos fijos, sin shell
+        [sys.executable, "-m", "odds_scanner", *command], check=False
+    )
+    return completed.returncode
+
+
+def _scheduler_log(console: Console) -> Callable[[str], None]:
+    log_file = DATA_DIR / "scheduler.log"
+
+    def log(message: str) -> None:
+        stamp = timeutil.utcnow().astimezone(CHILE_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        line = f"[{stamp}] {message}"
+        console.print(line)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    return log
+
+
+ScanSports = Annotated[
+    str, typer.Option("--sports", envvar="SCAN_SPORTS", help="Deportes separados por coma.")
+]
+ScanMarkets = Annotated[
+    str, typer.Option("--markets", envvar="SCAN_MARKETS", help="Mercados separados por coma.")
+]
+ScanRegions = Annotated[
+    str, typer.Option("--regions", envvar="SCAN_REGIONS", help="Regiones separadas por coma.")
+]
+
+
+def _job(sports_csv: str, markets: str, regions: str) -> ScanJob:
+    job = ScanJob(_split_list(sports_csv), _split_list(markets), _split_list(regions))
+    try:
+        if not job.sports:
+            raise ValueError("indica al menos un deporte")
+        job.cost  # noqa: B018 - valida regiones y mercados
+    except ValueError as exc:
+        raise _fail(str(exc)) from None
+    return job
+
+
+@app.command()
+def pipeline(
+    sports_csv: ScanSports = "soccer_epl",
+    markets: ScanMarkets = "h2h",
+    regions: ScanRegions = "eu",
+) -> None:
+    """Corrida completa (servicio scanner de Docker): verifica cuota, scan --yes, rank, export.
+
+    Si la reserva de cuota no alcanza, lo registra y no llama a la API (código 2).
+    """
+    console = _console()
+    job = _job(sports_csv, markets, regions)
+    code = run_once(job, runner=lambda cmd: _run_subcommand(cmd), log=_scheduler_log(console))
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def schedule(
+    times: Annotated[
+        str,
+        typer.Option(envvar="SCHEDULE_TIMES", help="Horas en hora de Chile, p. ej. 10:00,18:00."),
+    ] = "10:00,18:00",
+    sports_csv: ScanSports = "soccer_epl",
+    markets: ScanMarkets = "h2h",
+    regions: ScanRegions = "eu",
+    once: Annotated[bool, typer.Option("--once", help="Una corrida ahora y termina.")] = False,
+) -> None:
+    """Escaneo programado (por defecto 10:00 y 18:00 hora de Chile).
+
+    Antes de cada corrida verifica la cuota; si la reserva no alcanza, lo registra en
+    data/scheduler.log y no llama a la API.
+    """
+    console = _console()
+    try:
+        parsed = parse_times(times)
+    except ValueError as exc:
+        raise _fail(str(exc)) from None
+    job = _job(sports_csv, markets, regions)
+    log = _scheduler_log(console)
+    if once:
+        raise typer.Exit(code=run_once(job, runner=lambda cmd: _run_subcommand(cmd), log=log))
+    log(f"programador iniciado: {', '.join(t.strftime('%H:%M') for t in parsed)} (Chile)")
+    run_forever(
+        job,
+        parsed,
+        runner=lambda cmd: _run_subcommand(cmd),
+        log=log,
+        sleep=time.sleep,
+        clock=timeutil.utcnow,
+    )
 
 
 for _name, _command in LEDGER_COMMANDS.items():

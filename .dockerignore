@@ -1,0 +1,19 @@
+# Nada de secretos, datos locales ni artefactos en el contexto de build.
+.env
+.env.*
+!.env.example
+data/
+fixtures/
+tests/
+.venv/
+venv/
+.git/
+.github/
+**/__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+*.egg-info/

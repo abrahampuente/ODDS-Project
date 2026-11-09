@@ -455,3 +455,25 @@ def test_v2_database_is_migrated_to_v3(tmp_path: Path) -> None:
         assert new.schema_version() == 3
         [existing] = new.bets()
         assert existing.source == "manual" and existing.stake == 1_000
+
+
+def test_failed_migration_rolls_back_completely(tmp_path: Path) -> None:
+    import odds_scanner.ledger as ledger_module
+
+    path = tmp_path / "rollback.db"
+    with Ledger(path) as lg:
+        lg.init()
+    broken = (4, "CREATE TABLE nueva (x INTEGER);\nESTO NO ES SQL;")
+    original = ledger_module.MIGRATIONS
+    try:
+        ledger_module.MIGRATIONS = [*original, broken]
+        with pytest.raises(sqlite3.OperationalError):
+            Ledger(path)
+    finally:
+        ledger_module.MIGRATIONS = original
+    conn = sqlite3.connect(path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    versions = [r[0] for r in conn.execute("SELECT version FROM schema_version")]
+    conn.close()
+    assert "nueva" not in tables  # el CREATE de la migración rota no quedó a medias
+    assert max(versions) == SCHEMA_VERSION
