@@ -20,6 +20,7 @@ from odds_scanner.math import target_odds
 N_POTS = 4
 POT_INITIAL = 25_000
 GOAL = 500_000
+MIN_ODDS = 1.01  # cuota mínima que ofrece una casa; por debajo no hay ganancia posible
 DEFAULT_DB = Path("data/ledger.db")
 
 NOT_INITIALIZED = "SIN INICIAR"
@@ -202,7 +203,11 @@ class Ledger:
         self._clock = clock
         self._conn = sqlite3.connect(path)
         self._conn.row_factory = sqlite3.Row
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            self._conn.close()  # sin esto la conexión queda abierta si la migración falla
+            raise
 
     def __enter__(self) -> Self:
         return self
@@ -341,19 +346,30 @@ class Ledger:
         )
 
     def init(self, *, reset: bool = False, confirm: bool = False) -> list[Pot]:
-        """Crea los 4 pozos. Solo una vez; reiniciar exige reset=True y confirm=True."""
+        """Crea los 4 pozos. Solo una vez; reiniciar exige reset=True y confirm=True.
+
+        El reinicio solo se permite si no hay apuestas registradas: con apuestas
+        (pendientes o liquidadas) volver a 4 x 25.000 sería una recarga encubierta.
+        """
         if self.pots():
             if not reset:
                 raise RuleViolationError(
                     "los pozos ya existen; para reiniciar usa --reset --confirm"
                 )
             if not confirm:
-                raise RuleViolationError("el reinicio borra pozos y apuestas: agrega --confirm")
+                raise RuleViolationError("el reinicio recrea los 4 pozos: agrega --confirm")
         with self._conn:
             if reset:
-                summary = {"pots": [p.__dict__ for p in self.pots()], "bets": len(self.bets())}
-                self._conn.execute("DELETE FROM bets")
+                summary = {"pots": [p.__dict__ for p in self.pots()]}
+                # El DELETE toma el bloqueo de escritura antes de contar apuestas: ningún
+                # otro proceso puede registrar una entre la verificación y el reinicio.
                 self._conn.execute("DELETE FROM pots")
+                n_bets = int(self._conn.execute("SELECT COUNT(*) FROM bets").fetchone()[0])
+                if n_bets:
+                    raise RuleViolationError(
+                        f"no se puede reiniciar: hay {n_bets} apuesta(s) registrada(s) y "
+                        "volver a 4 x 25.000 sería una recarga (prohibida)"
+                    )
                 self._log("reset", summary)
             self._conn.executemany(
                 "INSERT INTO pots (id, initial, balance, status) VALUES (?, ?, ?, 'active')",
@@ -383,8 +399,8 @@ class Ledger:
             raise RuleViolationError(f"el pozo {pot_id} está {pot.status}")
         if stake <= 0:
             raise RuleViolationError("el stake debe ser un entero positivo (CLP)")
-        if not math.isfinite(odds) or odds <= 1.0:
-            raise RuleViolationError(f"cuota inválida: {odds} (debe ser > 1.0)")
+        if not math.isfinite(odds) or odds < MIN_ODDS:
+            raise RuleViolationError(f"cuota inválida: {odds} (debe ser >= {MIN_ODDS:.2f})")
         if stake > pot.balance:
             raise RuleViolationError(
                 f"stake {stake} supera el saldo del pozo {pot_id} ({pot.balance})"
@@ -437,9 +453,18 @@ class Ledger:
                     source,
                 ),
             )
-            self._conn.execute(
-                "UPDATE pots SET balance = balance - ? WHERE id = ?", (stake, pot_id)
-            )
+            # Descuento condicional: si otro proceso gastó el saldo entre check_bet y
+            # esta escritura, no se toca nada y la transacción completa se revierte.
+            debited = self._conn.execute(
+                "UPDATE pots SET balance = balance - ?"
+                " WHERE id = ? AND status = 'active' AND balance >= ?",
+                (stake, pot_id, stake),
+            ).rowcount
+            if debited != 1:
+                raise RuleViolationError(
+                    f"stake {stake} supera el saldo actual del pozo {pot_id} "
+                    "(cambió durante el registro)"
+                )
             bet_id = int(cur.lastrowid or 0)
             self._log(
                 "bet",
@@ -471,10 +496,17 @@ class Ledger:
         }[result]
         [pot_id] = current.pot_ids
         with self._conn:
-            self._conn.execute(
-                "UPDATE bets SET status = ?, payout = ?, settled_at = ? WHERE id = ?",
+            # Compare-and-set: solo liquida si sigue pendiente; evita el doble pago
+            # cuando dos procesos liquidan la misma apuesta a la vez.
+            updated = self._conn.execute(
+                "UPDATE bets SET status = ?, payout = ?, settled_at = ?"
+                " WHERE id = ? AND status = 'pending'",
                 (result, payout, self._now(), bet_id),
-            )
+            ).rowcount
+            if updated != 1:
+                raise RuleViolationError(
+                    f"la apuesta {bet_id} ya fue liquidada ({self.bet(bet_id).status})"
+                )
             self._conn.execute(
                 "UPDATE pots SET balance = balance + ? WHERE id = ?", (payout, pot_id)
             )
@@ -506,12 +538,34 @@ class Ledger:
                 raise RuleViolationError(f"el pozo {pot.id} está {pot.status}")
             if self._pending_stake(pot.id):
                 raise RuleViolationError(f"el pozo {pot.id} tiene apuestas pendientes")
-        moved = sum(self.pot(s).balance for s in sources)
+        # Las validaciones de arriba dan mensajes claros; las de abajo se repiten dentro de
+        # la transacción (UPDATE condicional) por si otro proceso apostó en el intertanto.
+        mergeable = (
+            "id = ? AND status = 'active' AND NOT EXISTS "
+            "(SELECT 1 FROM bets WHERE status = 'pending' AND pot_ids = ?)"
+        )
+
+        def changed_meanwhile(pot_id: int) -> RuleViolationError:
+            return RuleViolationError(
+                f"el pozo {pot_id} cambió durante el merge (apuesta nueva o estado distinto)"
+            )
+
+        moved = 0
         with self._conn:
+            locked = self._conn.execute(
+                f"UPDATE pots SET balance = balance WHERE {mergeable}",  # nosec B608
+                (into, json.dumps([into])),
+            ).rowcount
+            if locked != 1:
+                raise changed_meanwhile(into)
             for source in sources:
-                self._conn.execute(
-                    "UPDATE pots SET balance = 0, status = 'merged' WHERE id = ?", (source,)
-                )
+                moved += self.pot(source).balance  # leído con el bloqueo de escritura tomado
+                updated = self._conn.execute(
+                    f"UPDATE pots SET balance = 0, status = 'merged' WHERE {mergeable}",  # nosec B608
+                    (source, json.dumps([source])),
+                ).rowcount
+                if updated != 1:
+                    raise changed_meanwhile(source)
             self._conn.execute("UPDATE pots SET balance = balance + ? WHERE id = ?", (moved, into))
             self._log("merge", {"into": into, "sources": list(sources), "moved": moved})
         return self.pot(into)

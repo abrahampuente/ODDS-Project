@@ -1,11 +1,13 @@
 """Normaliza eventos de la API en filas planas (una por casa/mercado/línea/resultado).
 
 Descarta y cuenta: precios <= 1.0, mercados lay de exchanges y mercados
-incompletos (p. ej. h2h de fútbol sin los 3 resultados).
+incompletos (p. ej. h2h de fútbol sin los 3 resultados). Las cuotas de exchanges
+se convierten a cuota efectiva descontando su comisión (`price`); la cuota que
+publica el exchange queda en `gross_price`.
 """
 
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,6 +15,8 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict
 
 from odds_scanner.client import Event, Outcome
+from odds_scanner.exchanges import DEFAULT_COMMISSIONS
+from odds_scanner.math import net_odds
 
 CHILE_TZ = ZoneInfo("America/Santiago")
 DRAW = "Draw"
@@ -39,7 +43,9 @@ class OddsRow(BaseModel):
     line: float | None  # clave de agrupación: point (totals) o point del local (spreads)
     outcome: str
     point: float | None
-    price: float
+    price: float  # cuota efectiva (neta de comisión en exchanges)
+    gross_price: float  # cuota publicada por la casa
+    commission: float = 0.0
     last_update: datetime | None
 
 
@@ -86,12 +92,18 @@ def _is_complete(market_key: str, names: set[str], event: Event) -> bool:
     return len(names) >= 2
 
 
-def normalize_events(events: Iterable[Event]) -> NormalizeResult:
-    """Aplana eventos en filas OddsRow, descartando datos inválidos o incompletos."""
+def normalize_events(
+    events: Iterable[Event], commissions: Mapping[str, float] = DEFAULT_COMMISSIONS
+) -> NormalizeResult:
+    """Aplana eventos en filas OddsRow, descartando datos inválidos o incompletos.
+
+    `commissions` (casa -> comisión) convierte las cuotas de exchanges en cuota efectiva.
+    """
     result = NormalizeResult()
     for event in events:
         start_cl = to_chile(event.commence_time)
         for bookmaker in event.bookmakers:
+            commission = commissions.get(bookmaker.key, 0.0)
             for market in bookmaker.markets:
                 if market.key.endswith("_lay"):
                     result.discarded[LAY_MARKET] += len(market.outcomes)
@@ -120,7 +132,9 @@ def normalize_events(events: Iterable[Event]) -> NormalizeResult:
                             line=line,
                             outcome=o.name,
                             point=o.point,
-                            price=o.price,
+                            price=net_odds(o.price, commission) if commission else o.price,
+                            gross_price=o.price,
+                            commission=commission,
                             last_update=updated,
                         )
                         for o in outs

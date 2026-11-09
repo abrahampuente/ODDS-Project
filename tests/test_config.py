@@ -71,6 +71,15 @@ def test_negative_quota_reserve_is_rejected(tmp_path: Path) -> None:
         load_settings(env_file=env)
 
 
+@pytest.mark.parametrize("value", ["0", "10", "49"])
+def test_quota_reserve_cannot_go_below_50(tmp_path: Path, value: str) -> None:
+    """Auditoría fase 9: CLAUDE.md exige negarse con menos de 50; el entorno solo puede subirla."""
+    env = tmp_path / ".env"
+    env.write_text(f"MIN_QUOTA_RESERVE={value}\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_settings(env_file=env)
+
+
 @pytest.mark.parametrize(
     ("key", "expected"),
     [

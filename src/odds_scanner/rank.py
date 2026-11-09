@@ -13,13 +13,19 @@ from pydantic import BaseModel, ConfigDict
 
 from odds_scanner.math import margin
 from odds_scanner.normalize import OddsRow
-from odds_scanner.value import consensus_from_group, expected_value, label_ev
+from odds_scanner.value import (
+    DEFAULT_DEVIG,
+    DevigMethod,
+    consensus_from_group,
+    expected_value,
+    label_ev,
+)
 
 View = Literal["margin", "value"]
 
 ARBITRAGE_WARNING = (
     "Margen combinado negativo (posible arbitraje): casi siempre es una cuota "
-    "desactualizada o de un exchange sin descontar comisión. Verifica antes de confiar."
+    "desactualizada o una comisión de exchange mal configurada. Verifica antes de confiar."
 )
 
 
@@ -30,8 +36,10 @@ class BestPrice(BaseModel):
 
     outcome: str
     point: float | None
-    price: float
+    price: float  # cuota efectiva (neta de comisión en exchanges)
     bookmaker: str
+    gross_price: float  # cuota publicada; difiere de price solo en exchanges
+    commission: float = 0.0
 
 
 class MarketSummary(BaseModel):
@@ -83,8 +91,10 @@ class RankedOutcome(BaseModel):
     line: float | None
     outcome: str
     point: float | None
-    best_price: float
+    best_price: float  # cuota efectiva (neta de comisión en exchanges)
     bookmaker: str
+    gross_price: float  # cuota que verás en la casa
+    commission: float
     book_margin: float
     best_market_margin: float
     is_arbitrage: bool
@@ -117,8 +127,13 @@ class RankFilters:
             raise ValueError("min_odds no puede ser mayor que max_odds")
 
 
-def summarize_markets(rows: Iterable[OddsRow]) -> list[MarketSummary]:
-    """Agrupa filas por evento+mercado+línea y calcula márgenes y mejores cuotas."""
+def summarize_markets(
+    rows: Iterable[OddsRow], devig: DevigMethod = DEFAULT_DEVIG
+) -> list[MarketSummary]:
+    """Agrupa filas por evento+mercado+línea y calcula márgenes y mejores cuotas.
+
+    `devig` es el método para quitar el margen al estimar la probabilidad justa.
+    """
     groups: dict[tuple[str, str, float | None], list[OddsRow]] = defaultdict(list)
     for row in rows:
         groups[(row.event_id, row.market, row.line)].append(row)
@@ -137,11 +152,18 @@ def summarize_markets(rows: Iterable[OddsRow]) -> list[MarketSummary]:
             if current is None or (row.price, current.bookmaker) > (current.price, row.bookmaker):
                 best[row.outcome] = row
         best_prices = [
-            BestPrice(outcome=o, point=r.point, price=r.price, bookmaker=r.bookmaker)
+            BestPrice(
+                outcome=o,
+                point=r.point,
+                price=r.price,
+                bookmaker=r.bookmaker,
+                gross_price=r.gross_price,
+                commission=r.commission,
+            )
             for o, r in best.items()
         ]
         combined = margin([b.price for b in best_prices])
-        consensus = consensus_from_group(group)
+        consensus = consensus_from_group(group, devig)
         first = group[0]
         summaries.append(
             MarketSummary(
@@ -237,6 +259,8 @@ def rank(
                         point=best.point,
                         best_price=best.price,
                         bookmaker=best.bookmaker,
+                        gross_price=best.gross_price,
+                        commission=best.commission,
                         book_margin=s.margin_by_book[best.bookmaker],
                         best_market_margin=s.best_market_margin,
                         is_arbitrage=s.is_arbitrage,

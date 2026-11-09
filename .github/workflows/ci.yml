@@ -34,3 +34,11 @@ jobs:
         run: |
           docker run --rm odds-scanner:ci version
           docker run --rm --user 10001 odds-scanner:ci --help
+          docker run --rm --entrypoint python odds-scanner:ci -c "import sqlite3, zoneinfo; zoneinfo.ZoneInfo('America/Santiago'); print('sqlite', sqlite3.sqlite_version)"
+      # Trivy como contenedor, no como action: en 2026 se secuestraron casi todas las
+      # etiquetas de aquasecurity/trivy-action. 0.69.3 es una versión confirmada sana por
+      # Aqua; idealmente fija también su digest (aquasec/trivy@sha256:...).
+      - name: Trivy (falla con HIGH/CRITICAL que tengan parche)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3 \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 odds-scanner:ci

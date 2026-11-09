@@ -28,10 +28,12 @@ from odds_scanner.math import margin
 from odds_scanner.store import DEFAULT_DATA_DIR, load_last_rank
 
 MAX_MANUAL_MARGIN = 0.07
+MAX_ODDS_DECIMALS = 3  # CLAUDE.md: cuotas con 2-3 decimales (aplica a --odds manual)
 RANK_MAX_AGE = timedelta(minutes=30)
 
 ledger_app = typer.Typer(
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
     help="Registro de los 4 pozos (solo registra; nunca coloca apuestas reales).",
 )
 
@@ -178,6 +180,8 @@ def bet(
     commence_time: str | None = None
     line: float | None = None
     fair_prob: float | None = None
+    gross_odds: float | None = None
+    commission = 0.0
     if row is not None:
         if any(v is not None for v in manual.values()) or market_odds is not None:
             raise _fail("usa --row o los datos manuales (--odds, --event, ...), no ambos")
@@ -201,10 +205,16 @@ def bet(
         book_margin, ev, source = r.book_margin, r.ev, "row"
         event_id, commence_time = r.event_id, r.commence_time_utc.isoformat()
         line, fair_prob = r.line, r.fair_prob
+        gross_odds, commission = r.gross_price, r.commission
     else:
         missing = [flag for flag, value in manual.items() if value is None]
         if missing or odds is None:
             raise _fail(f"faltan {', '.join(missing)} (o usa --row N con una fila del ranking)")
+        if round(odds, MAX_ODDS_DECIMALS) != odds:
+            raise _fail(
+                f"--odds {odds} tiene más de {MAX_ODDS_DECIMALS} decimales: escribe la cuota "
+                "tal como la muestra la casa (p. ej. 2.10)"
+            )
         book_margin = _parse_market_odds(market_odds, odds) if market_odds else None
         source = "manual"
     if odds is None or not (event and market and selection and bookmaker):
@@ -226,6 +236,11 @@ def bet(
         console.print(
             f"  Cuota: {odds:.2f} en {bookmaker} ({'fila del ranking' if row else 'manual'})"
         )
+        if gross_odds is not None and commission:
+            console.print(
+                f"  Exchange: verás {gross_odds:.2f} en el sitio; descontando la comisión "
+                f"de {commission:.1%} equivale a {odds:.2f} (la que se registra)."
+            )
         console.print(f"  Selección: {selection} | {event} | {market}")
         console.print(f"  Pago si gana: {clp(payout)} | Ganancia posible: {clp(payout - stake)}")
         console.print(

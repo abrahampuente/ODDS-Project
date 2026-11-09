@@ -1,6 +1,7 @@
 """Tests de fase 8: doctor con key en el entorno, comando quota, pipeline y programador."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
@@ -11,11 +12,16 @@ from typer.testing import CliRunner
 from odds_scanner.cli import app
 from odds_scanner.client import BASE_URL
 from odds_scanner.scheduler import (
+    BUDGET_EXHAUSTED,
+    MonthlyBudget,
     ScanJob,
+    fixture_commands,
     job_commands,
+    month_key,
     next_run,
     parse_times,
     run_forever,
+    run_from_fixture,
     run_once,
 )
 from tests.conftest import FAKE_KEY
@@ -69,6 +75,38 @@ def test_quota_refresh_uses_free_endpoint(workdir: Path) -> None:
     assert result.exit_code == 0, result.output
     assert route.called
     assert "restantes=120" in result.output and "alcanza" in result.output
+
+
+@pytest.mark.parametrize("command", [["quota"], ["fetch", "soccer_epl"], ["scan", "--sports", "x"]])
+def test_invalid_config_fails_cleanly_without_leaking_key(
+    workdir: Path, command: list[str]
+) -> None:
+    """Auditoría fase 9: MIN_QUOTA_RESERVE < 50 se rechaza con mensaje claro, sin traceback."""
+    (workdir / ".env").write_text(
+        f"ODDS_API_KEY={FAKE_KEY}\nMIN_QUOTA_RESERVE=0\n", encoding="utf-8"
+    )
+    seed_quota(workdir, 500)
+    result = runner.invoke(app, command)
+    assert result.exit_code == 1
+    assert "MIN_QUOTA_RESERVE" in result.output and ">= 50" in result.output
+    assert "Traceback" not in result.output
+    assert FAKE_KEY not in result.output
+    assert not isinstance(result.exception, ValueError)  # salida controlada (typer.Exit)
+
+
+def test_non_numeric_config_value_fails_cleanly(workdir: Path) -> None:
+    (workdir / ".env").write_text("SCHEDULE_MONTHLY_BUDGET=muchas\n", encoding="utf-8")
+    result = runner.invoke(app, ["quota"])
+    assert result.exit_code == 1
+    assert "SCHEDULE_MONTHLY_BUDGET debe ser un número" in result.output
+    assert "muchas" not in result.output  # nunca se repite el valor ingresado
+
+
+def test_cli_apps_never_show_locals_in_tracebacks() -> None:
+    from odds_scanner.ledger_cli import ledger_app
+
+    assert app.pretty_exceptions_show_locals is False
+    assert ledger_app.pretty_exceptions_show_locals is False
 
 
 def test_quota_need_above_reserve_exits_2(workdir: Path) -> None:
@@ -185,6 +223,28 @@ def test_run_once_stops_on_failed_step() -> None:
     assert any("scan" in line and "falló" in line for line in logs)
 
 
+def test_fixture_commands_skip_quota_check() -> None:
+    assert fixture_commands(Path("f.json")) == [
+        ["scan", "--from-fixture", "f.json", "--yes"],
+        ["rank"],
+        ["export", "--format", "csv"],
+    ]
+
+
+def test_run_from_fixture_stops_on_failed_step() -> None:
+    calls: list[list[str]] = []
+    logs: list[str] = []
+
+    def fake(cmd: list[str]) -> int:
+        calls.append(cmd)
+        return 1 if cmd[0] == "rank" else 0
+
+    assert run_from_fixture(Path("f.json"), runner=fake, log=logs.append) == 1
+    assert [c[0] for c in calls] == ["scan", "rank"]
+    assert any("0 consultas" in line for line in logs)
+    assert any("rank" in line and "falló" in line for line in logs)
+
+
 def test_run_forever_waits_until_each_time() -> None:
     clock = [datetime(2026, 11, 9, 12, 0, tzinfo=UTC)]  # 09:00 en Chile
     slept: list[float] = []
@@ -234,3 +294,122 @@ def test_run_subcommand_spawns_real_process(capfd: pytest.CaptureFixture[str]) -
     assert _run_subcommand(["version"]) == 0
     assert __version__ in capfd.readouterr().out
     assert _run_subcommand(["comando-que-no-existe"]) != 0
+
+
+# --- tope mensual del programador ---------------------------------------------
+
+NOV = datetime(2026, 11, 9, 13, 0, tzinfo=UTC)
+
+
+def ok_runner(calls: list[list[str]]) -> Callable[[list[str]], int]:
+    def fake(cmd: list[str]) -> int:
+        calls.append(cmd)
+        return 0
+
+    return fake
+
+
+def test_month_key_uses_chile_time() -> None:
+    assert month_key(datetime(2026, 12, 1, 2, 0, tzinfo=UTC)) == "2026-11"  # 23:00 del 30-11 CL
+    assert month_key(datetime(2026, 12, 1, 4, 0, tzinfo=UTC)) == "2026-12"
+
+
+def test_budget_records_each_scan(tmp_path: Path) -> None:
+    budget = MonthlyBudget(tmp_path / "b.json", limit=5)
+    calls: list[list[str]] = []
+    logs: list[str] = []
+    assert run_once(JOB, runner=ok_runner(calls), log=logs.append, budget=budget, now=NOV) == 0
+    assert budget.spent("2026-11") == JOB.cost
+    assert any("tope mensual" in line for line in logs)
+
+
+def test_budget_blocks_before_calling_api(tmp_path: Path) -> None:
+    budget = MonthlyBudget(tmp_path / "b.json", limit=JOB.cost)
+    budget.add("2026-11", 1)
+    calls: list[list[str]] = []
+    logs: list[str] = []
+    code = run_once(JOB, runner=ok_runner(calls), log=logs.append, budget=budget, now=NOV)
+    assert code == BUDGET_EXHAUSTED
+    assert calls == []  # ni siquiera verifica la cuota
+    assert any("tope mensual alcanzado" in line for line in logs)
+
+
+def test_budget_zero_blocks_everything(tmp_path: Path) -> None:
+    budget = MonthlyBudget(tmp_path / "b.json", limit=0)
+    calls: list[list[str]] = []
+    code = run_once(JOB, runner=ok_runner(calls), log=lambda _: None, budget=budget, now=NOV)
+    assert code == BUDGET_EXHAUSTED and calls == []
+
+
+def test_budget_resets_each_month_and_survives_bad_file(tmp_path: Path) -> None:
+    path = tmp_path / "b.json"
+    budget = MonthlyBudget(path, limit=10)
+    budget.add("2026-10", 10)
+    assert budget.spent("2026-10") == 10
+    assert budget.spent("2026-11") == 0
+    assert budget.allows("2026-11", 10) is True
+    path.write_text("no es json", encoding="utf-8")
+    assert budget.spent("2026-11") == 0
+    path.write_text(json.dumps({"month": "2026-11", "spent": -3}), encoding="utf-8")
+    assert budget.spent("2026-11") == 0
+    path.write_text(json.dumps(["2026-11"]), encoding="utf-8")
+    assert budget.spent("2026-11") == 0
+
+
+def test_budget_counts_failed_scan(tmp_path: Path) -> None:
+    budget = MonthlyBudget(tmp_path / "b.json", limit=10)
+
+    def fake(cmd: list[str]) -> int:
+        return 1 if cmd[0] == "scan" else 0
+
+    assert run_once(JOB, runner=fake, log=lambda _: None, budget=budget, now=NOV) == 1
+    assert budget.spent("2026-11") == JOB.cost
+
+
+def test_budget_not_spent_when_quota_insufficient(tmp_path: Path) -> None:
+    budget = MonthlyBudget(tmp_path / "b.json", limit=10)
+    code = run_once(JOB, runner=lambda _: 2, log=lambda _: None, budget=budget, now=NOV)
+    assert code == 2
+    assert budget.spent("2026-11") == 0
+
+
+def test_budget_validation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        MonthlyBudget(tmp_path / "b.json", limit=-1)
+    with pytest.raises(ValueError, match="now"):
+        run_once(JOB, runner=lambda _: 0, log=lambda _: None, budget=MonthlyBudget(tmp_path, 1))
+
+
+def test_run_forever_stops_calling_api_when_budget_runs_out(tmp_path: Path) -> None:
+    clock = [datetime(2026, 11, 9, 12, 0, tzinfo=UTC)]
+    budget = MonthlyBudget(tmp_path / "b.json", limit=2 * JOB.cost)
+    calls: list[list[str]] = []
+
+    def sleep(seconds: float) -> None:
+        clock[0] += timedelta(seconds=seconds)
+
+    run_forever(
+        JOB,
+        TIMES,
+        runner=ok_runner(calls),
+        log=lambda _: None,
+        sleep=sleep,
+        clock=lambda: clock[0],
+        max_runs=4,
+        budget=budget,
+    )
+    assert sum(1 for c in calls if c[0] == "scan") == 2
+    assert budget.spent("2026-11") == 2 * JOB.cost
+
+
+def test_schedule_once_respects_monthly_budget(
+    monkeypatch: pytest.MonkeyPatch, workdir: Path
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr("odds_scanner.cli._run_subcommand", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setenv("SCHEDULE_MONTHLY_BUDGET", "0")
+    result = runner.invoke(app, ["schedule", "--once", "--sports", "soccer_epl"])
+    assert result.exit_code == BUDGET_EXHAUSTED, result.output
+    assert calls == []
+    log = (workdir / "data" / "scheduler.log").read_text(encoding="utf-8")
+    assert "tope mensual alcanzado" in log

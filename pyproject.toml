@@ -61,6 +61,8 @@ init_typed = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# Una conexión o archivo sin cerrar (ResourceWarning) hace fallar la suite.
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning", "error::ResourceWarning"]
 
 [tool.coverage.run]
 source = ["odds_scanner"]

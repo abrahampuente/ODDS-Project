@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
+from pydantic import ValidationError
+from pydantic_core import ErrorDetails
 from rich.console import Console
 from rich.table import Table
 
@@ -24,7 +26,7 @@ from odds_scanner.client import (
     estimate_cost,
     read_quota,
 )
-from odds_scanner.config import DEFAULT_ENV_FILE, ConfigError, load_settings
+from odds_scanner.config import DEFAULT_ENV_FILE, ConfigError, Settings, load_settings
 from odds_scanner.doctor import run_checks
 from odds_scanner.export import build_sheets, export_csv, export_xlsx
 from odds_scanner.ledger import DEFAULT_DB, Ledger
@@ -41,9 +43,12 @@ from odds_scanner.rank import (
 from odds_scanner.report import build_report, format_report
 from odds_scanner.scheduler import (
     QUOTA_INSUFFICIENT,
+    MonthlyBudget,
     ScanJob,
+    month_key,
     parse_times,
     run_forever,
+    run_from_fixture,
     run_once,
 )
 from odds_scanner.store import (
@@ -59,7 +64,12 @@ from odds_scanner.value import EV_DISCLAIMER, INSUFFICIENT_DATA, MIN_BOOKS
 DATA_DIR = Path("data")
 FIXTURES_DIR = Path("fixtures")
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, help="Escáner de cuotas.")
+app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="Escáner de cuotas.",
+    pretty_exceptions_show_locals=False,  # un traceback nunca debe mostrar la API key
+)
 app.add_typer(ledger_app, name="ledger")
 
 
@@ -97,9 +107,40 @@ def _fail(message: str) -> typer.Exit:
     return typer.Exit(code=1)
 
 
+def _describe_config_error(err: ErrorDetails) -> str:
+    """'MIN_QUOTA_RESERVE debe ser >= 50'. Nunca incluye el valor ingresado."""
+    name = str(err["loc"][0]).upper() if err["loc"] else "configuración"
+    ctx = err.get("ctx", {})
+    if err["type"] == "greater_than_equal":
+        return f"{name} debe ser >= {ctx.get('ge')}"
+    if err["type"] in ("int_parsing", "int_type", "float_parsing"):
+        return f"{name} debe ser un número"
+    return f"{name}: valor inválido ({err['type']})"
+
+
+def _settings() -> Settings:
+    """Configuración validada; con un valor inválido en .env o entorno sale con mensaje claro.
+
+    El mensaje nombra la variable y la regla, nunca el valor (podría ser la API key).
+    """
+    try:
+        return load_settings()
+    except ValidationError as exc:
+        problems = "; ".join(_describe_config_error(e) for e in exc.errors(include_input=False))
+        raise _fail(f"configuración inválida en .env o entorno: {problems}") from None
+
+
+def _commissions() -> dict[str, float]:
+    """Comisiones de exchanges desde la configuración."""
+    try:
+        return _settings().commissions()
+    except ConfigError as exc:
+        raise _fail(str(exc)) from None
+
+
 def _make_client() -> OddsClient:
     try:
-        settings = load_settings()
+        settings = _settings()
         key = settings.require_api_key()
     except ConfigError as exc:
         raise _fail(str(exc)) from None
@@ -265,7 +306,7 @@ def _rank_table(title: str, rows: Sequence[RankedOutcome]) -> Table:
             market_label,
             r.outcome if r.point is None else f"{r.outcome} {r.point:+g}",
             f"{r.best_price:.2f}",
-            r.bookmaker,
+            ("*" if r.commission else "") + r.bookmaker,  # prefijo: sobrevive al recorte
             f"{r.book_margin:+.2%}",
             f"{r.best_market_margin:+.2%}" + (" ARB" if r.is_arbitrage else "    "),
             str(r.n_books),
@@ -305,7 +346,7 @@ def _show_ranking(
     top: int,
 ) -> None:
     """Normaliza, rankea, imprime y guarda el ranking (base de `bet --row N`)."""
-    normalized = normalize_events(events)
+    normalized = normalize_events(events, _commissions())
     summaries = summarize_markets(normalized.rows)
     now = timeutil.utcnow()
     all_rows = rank(summaries, filters, now=now)
@@ -338,6 +379,13 @@ def _show_ranking(
     sharp_books = sorted({r.sharp_book for r in shown if r.sharp_book})
     if sharp_books:
         console.print(f"Referencia sharp disponible: {', '.join(sharp_books)}")
+    exchanges = sorted({(r.bookmaker, r.commission) for r in shown if r.commission})
+    if exchanges:
+        detail = ", ".join(f"{book} {rate:.1%}" for book, rate in exchanges)
+        console.print(
+            f"* Exchange: la cuota mostrada ya descuenta la comisión ({detail}). "
+            "En el sitio verás la cuota bruta."
+        )
     if any(r.is_arbitrage for r in shown):
         console.print(f"ADVERTENCIA (ARB): {ARBITRAGE_WARNING}")
     console.print(f"ADVERTENCIA (EV): {EV_DISCLAIMER}")
@@ -407,11 +455,43 @@ def value_cmd(
     _show_ranking(_console(), events, source=source, filters=filters, view=RankView.value, top=top)
 
 
+def _scan_from_fixture(
+    console: Console,
+    fixture: Path,
+    sports_csv: str | None,
+    hours: float | None,
+    odds_min: float | None,
+    odds_max: float | None,
+    view: RankView,
+    top: int,
+) -> None:
+    """scan sin API: carga la fixture, la guarda como captura y la rankea."""
+    events = _load_fixture_events(fixture)
+    sports = list(dict.fromkeys(e.sport_key for e in events))
+    markets = list(dict.fromkeys(m.key for e in events for b in e.bookmakers for m in b.markets))
+    console.print(f"Fixture {fixture}: {len(events)} eventos; no se llamó a la API (0 consultas).")
+    path = save_capture(
+        DATA_DIR,
+        events,
+        sports=sports,
+        markets=markets,
+        regions=[],
+        captured_at=timeutil.utcnow(),
+    )
+    console.print(f"Captura guardada: {path}")
+    filters = _filters(sports_csv, None, hours, odds_min, odds_max)
+    _show_ranking(console, events, source=f"fixture {fixture}", filters=filters, view=view, top=top)
+
+
 @app.command()
 def scan(
     sports_csv: Annotated[
-        str, typer.Option("--sports", help="Deportes separados por coma, p. ej. soccer_epl.")
-    ],
+        str | None,
+        typer.Option(
+            "--sports",
+            help="Deportes separados por coma, p. ej. soccer_epl (obligatorio sin --from-fixture).",
+        ),
+    ] = None,
     markets: Annotated[str, typer.Option(help="Mercados separados por coma.")] = "h2h",
     regions: Annotated[str, typer.Option(help="Regiones separadas por coma.")] = "eu",
     hours: HoursOpt = None,
@@ -423,13 +503,26 @@ def scan(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Solo muestra el costo; no llama a la API.")
     ] = False,
+    from_fixture: Annotated[
+        Path | None,
+        typer.Option(
+            "--from-fixture",
+            help="Usa un JSON grabado en vez de la API (0 consultas); lo guarda como captura.",
+        ),
+    ] = None,
 ) -> None:
     """Captura cuotas de varios deportes y las rankea.
 
     Muestra el costo estimado en consultas y pide confirmación (y/N) antes de llamar a
-    la API; --yes la omite. Respeta la reserva mínima de cuota.
+    la API; --yes la omite. Respeta la reserva mínima de cuota. Con --from-fixture no
+    llama a la API: sirve para probar el flujo completo sin gastar cuota.
     """
     console = _console()
+    if from_fixture is not None:
+        _scan_from_fixture(console, from_fixture, sports_csv, hours, odds_min, odds_max, view, top)
+        return
+    if sports_csv is None:
+        raise _fail("indica los deportes con --sports (o usa --from-fixture ARCHIVO)")
     sport_list = _split_list(sports_csv)
     region_list, market_list = _split_list(regions), _split_list(markets)
     if not sport_list:
@@ -439,7 +532,7 @@ def scan(
     except ValueError as exc:
         raise _fail(str(exc)) from None
     total = per_sport * len(sport_list)
-    reserve = load_settings().min_quota_reserve
+    reserve = _settings().min_quota_reserve
     console.print(
         f"Costo estimado: {total} consultas ({len(sport_list)} deportes x {len(market_list)} "
         f"mercados x {len(region_list)} regiones; 0 si no hay eventos)"
@@ -541,6 +634,7 @@ def report(db: Annotated[Path, typer.Option(help="Base del ledger.")] = DEFAULT_
     with Ledger(db) as ledger:
         state, bets = ledger.state(), ledger.bets()
     captures = list_captures(DATA_DIR)
+    commissions = _commissions()
     closing: dict[int, float] = {}
     for b in bets:
         if b.event_id is None or b.commence_time is None:
@@ -552,6 +646,7 @@ def report(db: Annotated[Path, typer.Option(help="Base del ledger.")] = DEFAULT_
             line=b.line,
             selection=b.selection,
             commence_time=datetime.fromisoformat(b.commence_time),
+            commissions=commissions,
         )
         if price is not None:
             closing[b.id] = price
@@ -575,7 +670,7 @@ def quota(
 ) -> None:
     """Muestra la cuota de la API y verifica si alcanza para una corrida."""
     console = _console()
-    reserve = load_settings().min_quota_reserve
+    reserve = _settings().min_quota_reserve
     if refresh:
         with _make_client() as client:
             try:
@@ -594,6 +689,11 @@ def quota(
         console.print(f"reserva insuficiente: quedarían {after} consultas < reserva {reserve}")
         raise typer.Exit(code=QUOTA_INSUFFICIENT)
     console.print(f"alcanza: quedarían {after} consultas (reserva {reserve})")
+
+
+def _monthly_budget() -> int:
+    """Tope mensual del programador desde la configuración (SCHEDULE_MONTHLY_BUDGET)."""
+    return _settings().schedule_monthly_budget
 
 
 def _run_subcommand(command: list[str]) -> int:
@@ -645,12 +745,25 @@ def pipeline(
     sports_csv: ScanSports = "soccer_epl",
     markets: ScanMarkets = "h2h",
     regions: ScanRegions = "eu",
+    from_fixture: Annotated[
+        Path | None,
+        typer.Option(
+            "--from-fixture",
+            help="Corrida offline desde un JSON grabado: scan, rank, export sin gastar cuota.",
+        ),
+    ] = None,
 ) -> None:
     """Corrida completa (servicio scanner de Docker): verifica cuota, scan --yes, rank, export.
 
     Si la reserva de cuota no alcanza, lo registra y no llama a la API (código 2).
+    Con --from-fixture hace el mismo flujo sin API (prueba E2E sin gastar cuota).
     """
     console = _console()
+    if from_fixture is not None:
+        code = run_from_fixture(
+            from_fixture, runner=lambda cmd: _run_subcommand(cmd), log=_scheduler_log(console)
+        )
+        raise typer.Exit(code=code)
     job = _job(sports_csv, markets, regions)
     code = run_once(job, runner=lambda cmd: _run_subcommand(cmd), log=_scheduler_log(console))
     raise typer.Exit(code=code)
@@ -669,8 +782,9 @@ def schedule(
 ) -> None:
     """Escaneo programado (por defecto 10:00 y 18:00 hora de Chile).
 
-    Antes de cada corrida verifica la cuota; si la reserva no alcanza, lo registra en
-    data/scheduler.log y no llama a la API.
+    Antes de cada corrida verifica la cuota y el tope mensual (SCHEDULE_MONTHLY_BUDGET,
+    60 consultas por defecto); si no alcanza, lo registra en data/scheduler.log y no
+    llama a la API.
     """
     console = _console()
     try:
@@ -679,9 +793,22 @@ def schedule(
         raise _fail(str(exc)) from None
     job = _job(sports_csv, markets, regions)
     log = _scheduler_log(console)
+    budget = MonthlyBudget(DATA_DIR / "scheduler_budget.json", _monthly_budget())
     if once:
-        raise typer.Exit(code=run_once(job, runner=lambda cmd: _run_subcommand(cmd), log=log))
+        code = run_once(
+            job,
+            runner=lambda cmd: _run_subcommand(cmd),
+            log=log,
+            budget=budget,
+            now=timeutil.utcnow(),
+        )
+        raise typer.Exit(code=code)
+    month = month_key(timeutil.utcnow())
     log(f"programador iniciado: {', '.join(t.strftime('%H:%M') for t in parsed)} (Chile)")
+    log(
+        f"tope mensual: {budget.spent(month)}/{budget.limit} consultas usadas en {month} "
+        f"(cada corrida gasta hasta {job.cost})"
+    )
     run_forever(
         job,
         parsed,
@@ -689,6 +816,7 @@ def schedule(
         log=log,
         sleep=time.sleep,
         clock=timeutil.utcnow,
+        budget=budget,
     )
 
 

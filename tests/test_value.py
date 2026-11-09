@@ -8,10 +8,11 @@ from typing import Any
 import pytest
 
 from odds_scanner.client import Event
-from odds_scanner.math import fair_probs, overround
+from odds_scanner.math import fair_probs, fair_probs_power, overround
 from odds_scanner.normalize import OddsRow, normalize_events
 from odds_scanner.rank import RankFilters, rank, summarize_markets
 from odds_scanner.value import (
+    DEFAULT_DEVIG,
     INSUFFICIENT_DATA,
     MIN_BOOKS,
     consensus_fair_prob,
@@ -79,6 +80,7 @@ def rows_of(*events: Event) -> list[OddsRow]:
     return normalize_events(events).rows
 
 
+# Método proporcional (devig="proportional"):
 # 4 casas con 1.90/1.90 (justa 0.5/0.5) + 1 casa con 2.20/1.65 (justa 3/7, 4/7).
 # Consenso: A = (4*0.5 + 3/7)/5 = 17/35 ; B = 18/35.
 # Mejor A = 2.20 -> EV = 2.2*17/35 - 1 = 2.4/35 = +6.857% (revisar)
@@ -96,7 +98,9 @@ FIVE_BOOKS = {
 
 
 def test_consensus_five_books_known_values() -> None:
-    result = consensus_fair_prob(rows_of(tennis_event(FIVE_BOOKS)), "t1", "h2h")
+    result = consensus_fair_prob(
+        rows_of(tennis_event(FIVE_BOOKS)), "t1", "h2h", devig="proportional"
+    )
     assert result.n_books == 5
     assert result.sufficient is True
     assert result.fair_probs is not None
@@ -105,7 +109,7 @@ def test_consensus_five_books_known_values() -> None:
 
 
 def test_ev_five_books_known_values() -> None:
-    summaries = summarize_markets(rows_of(tennis_event(FIVE_BOOKS)))
+    summaries = summarize_markets(rows_of(tennis_event(FIVE_BOOKS)), devig="proportional")
     by_outcome = {r.outcome: r for r in rank(summaries, now=NOW)}
     a, b = by_outcome["A"], by_outcome["B"]
     assert (a.best_price, a.bookmaker) == (2.20, "outlier")
@@ -140,7 +144,7 @@ def test_identical_books_ev_equals_inverse_overround_minus_one() -> None:
     odds = (2.10, 3.40, 3.60)
     event = soccer_event({f"casa{i}": odds for i in range(5)})
     expected = 1 / overround(list(odds)) - 1
-    ranked = rank(summarize_markets(rows_of(event)), now=NOW)
+    ranked = rank(summarize_markets(rows_of(event), devig="proportional"), now=NOW)
     assert len(ranked) == 3
     for row in ranked:
         assert row.ev == pytest.approx(expected)
@@ -183,7 +187,7 @@ def test_sharp_prob_prefers_pinnacle() -> None:
 
 def test_sharp_prob_falls_back_to_lowest_margin_book() -> None:
     books = {**FIVE_BOOKS, "baja": (2.02, 1.98)}  # margen ~0.01, el menor
-    result = consensus_fair_prob(rows_of(tennis_event(books)), "t1", "h2h")
+    result = consensus_fair_prob(rows_of(tennis_event(books)), "t1", "h2h", devig="proportional")
     assert result.sharp_book == "baja"
     assert result.sharp_probs is not None
     assert list(result.sharp_probs.values()) == pytest.approx(fair_probs([2.02, 1.98]))
@@ -242,3 +246,62 @@ def test_margin_view_still_includes_insufficient() -> None:
 def test_invalid_view_rejected() -> None:
     with pytest.raises(ValueError):
         rank([], now=NOW, view="nope")  # type: ignore[arg-type]
+
+
+# --- método power (default): corrige el sesgo hacia cuotas altas ---------------
+
+# Mercado típico de fútbol con un favorito claro: la casa carga más margen al
+# no favorito (cuota 7.50) que el proporcional no detecta.
+SOCCER_ODDS = (1.40, 4.60, 7.50)
+
+
+def test_default_devig_is_power() -> None:
+    assert DEFAULT_DEVIG == "power"
+    event = tennis_event(FIVE_BOOKS)
+    default = consensus_fair_prob(rows_of(event), "t1", "h2h")
+    power = consensus_fair_prob(rows_of(event), "t1", "h2h", devig="power")
+    assert default.fair_probs == power.fair_probs
+
+
+def test_power_consensus_known_values() -> None:
+    result = consensus_fair_prob(rows_of(tennis_event(FIVE_BOOKS)), "t1", "h2h")
+    outlier_a, outlier_b = fair_probs_power([2.20, 1.65])
+    assert result.fair_probs is not None
+    assert result.fair_probs["A"] == pytest.approx((4 * 0.5 + outlier_a) / 5)
+    assert result.fair_probs["B"] == pytest.approx((4 * 0.5 + outlier_b) / 5)
+
+
+def test_identical_books_ev_with_power() -> None:
+    event = soccer_event({f"casa{i}": SOCCER_ODDS for i in range(5)})
+    fair = fair_probs_power(list(SOCCER_ODDS))
+    ranked = {r.outcome: r for r in rank(summarize_markets(rows_of(event)), now=NOW)}
+    for (outcome, odds), prob in zip(
+        zip(("L", "Draw", "V"), SOCCER_ODDS, strict=True), fair, strict=True
+    ):
+        assert ranked[outcome].ev == pytest.approx(odds * prob - 1)
+        assert ranked[outcome].label == "evitar"
+
+
+def test_power_removes_longshot_ev_inflation() -> None:
+    """Con proporcional el no favorito sale con EV más alto que con power."""
+    books = {f"casa{i}": SOCCER_ODDS for i in range(4)}
+    books["blanda"] = (1.36, 4.80, 8.20)  # casa que paga más al no favorito
+    event = soccer_event(books)
+    power = {r.outcome: r for r in rank(summarize_markets(rows_of(event)), now=NOW)}
+    prop = {
+        r.outcome: r for r in rank(summarize_markets(rows_of(event), devig="proportional"), now=NOW)
+    }
+    longshot_power, longshot_prop = power["V"], prop["V"]
+    assert longshot_power.best_price == longshot_prop.best_price == 8.20
+    assert longshot_power.fair_prob is not None and longshot_prop.fair_prob is not None
+    assert longshot_power.fair_prob < longshot_prop.fair_prob
+    assert longshot_power.ev is not None and longshot_prop.ev is not None
+    assert longshot_power.ev < longshot_prop.ev
+    assert power["L"].fair_prob is not None and prop["L"].fair_prob is not None
+    assert power["L"].fair_prob > prop["L"].fair_prob
+
+
+def test_unknown_devig_method_raises() -> None:
+    rows = rows_of(tennis_event(FIVE_BOOKS))
+    with pytest.raises(ValueError, match="devig"):
+        consensus_fair_prob(rows, "t1", "h2h", devig="x")  # type: ignore[arg-type]

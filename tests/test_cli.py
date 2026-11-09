@@ -171,7 +171,8 @@ def test_rank_table_fits_120_columns() -> None:
     rows = [line for line in result.output.splitlines() if " h2h " in line]
     assert len(rows) == 15
     assert all(len(line.rstrip()) <= 120 for line in rows)
-    assert all(" ARB" in line for line in rows[:3])  # Chelsea-Leeds
+    # Brentford-Everton. Chelsea-Leeds ya no es ARB: venía de la cuota bruta de Betfair.
+    assert all(" ARB" in line for line in rows[:3])
 
 
 def test_rank_applies_odds_filter() -> None:

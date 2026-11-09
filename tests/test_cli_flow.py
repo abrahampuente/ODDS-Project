@@ -147,10 +147,12 @@ def test_scan_yes_skips_prompt_and_applies_filters(flow: Path) -> None:
     assert "[y/N]" not in out
     last = load_last_rank(flow / "data")
     assert last is not None
-    assert {r.outcome for r in last.rows} == {
-        "Chelsea",
-        "Draw",
-    }  # mejores 3.75 y 3.50; Arsenal 2.14 queda fuera
+    # Con comisión de betfair (5%) las mejores cuotas efectivas son: Chelsea 3.6125
+    # (betfair 3.75 neta), Draw 3.40 (pinnacle; betfair 3.50 neta = 3.375) y Arsenal 2.10.
+    # Solo Chelsea cae en [3.5, 5.5]. Antes de descontar comisión entraba también Draw.
+    [row] = last.rows
+    assert (row.outcome, row.bookmaker, row.gross_price) == ("Chelsea", "betfair_ex_eu", 3.75)
+    assert row.best_price == pytest.approx(3.6125)
 
 
 def test_scan_blocked_by_quota_reserve_before_prompt(flow: Path) -> None:
@@ -481,12 +483,15 @@ def test_report_shows_clv_from_capture(flow: Path) -> None:
         captured_at=NOW,  # antes del inicio de todos los partidos
     )
     rank_fixture()
+    last = load_last_rank(flow / "data")
+    assert last is not None
+    taken = last.rows[0].best_price
     code, out = invoke("bet", "--row", "1", "--pot", "1", "--stake", "1000", "--yes")
     assert code == 0, out
     code, out = invoke("report")
     assert code == 0, out
     assert "CLV promedio: +0.00% (1 apuestas)" in out
-    assert "#1: tomada 1.94 vs cierre 1.94" in out
+    assert f"#1: tomada {taken:.2f} vs cierre {taken:.2f}" in out
 
 
 def test_manual_bet_rejects_empty_text_fields(flow: Path) -> None:
@@ -509,6 +514,74 @@ def test_manual_bet_rejects_empty_text_fields(flow: Path) -> None:
         "--yes",
     )
     assert code == 1 and "incompletos" in out
+
+
+@pytest.mark.parametrize("odds", ["2.1234", "1.0000001"])
+def test_manual_bet_rejects_odds_with_more_than_3_decimals(flow: Path, odds: str) -> None:
+    """Auditoría fase 9: 1.0000001 se registraba y se mostraba como 1.00."""
+    code, out = invoke(
+        "bet",
+        "--pot",
+        "1",
+        *("--stake", "100", "--odds", odds, "--event", "A - B", "--market", "h2h"),
+        *("--selection", "A", "--bookmaker", "casa", "--yes", "--accept-high-margin"),
+    )
+    assert code == 1 and "decimales" in out
+    with Ledger(flow / "data" / "ledger.db") as lg:
+        assert lg.bets() == []
+
+
+# --- modo offline con --from-fixture (auditoría fase 9) -------------------------
+
+
+def test_scan_from_fixture_never_calls_api(flow: Path) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(url__startswith=BASE_URL)
+        code, out = invoke("scan", "--from-fixture", str(REAL), "--top", "3")
+    assert code == 0, out
+    assert not route.called
+    assert not (flow / "data" / "quota.json").exists()
+    assert "no se llamó a la API (0 consultas)" in " ".join(out.split())  # rich corta a 120
+    capture = latest_capture(flow / "data")
+    assert capture is not None and len(capture.events) == 20
+    assert capture.sports == ["soccer_epl"]
+    last = load_last_rank(flow / "data")
+    # last_rank guarda el ranking completo (--top solo limita la tabla), igual que `rank`
+    assert last is not None and len(last.rows) == 60
+    assert last.source == f"fixture {REAL}"
+
+
+def test_scan_without_sports_or_fixture_fails(flow: Path) -> None:
+    code, out = invoke("scan", "--yes")
+    assert code == 1 and "--sports" in out
+
+
+def test_scan_from_missing_fixture_fails(flow: Path) -> None:
+    code, out = invoke("scan", "--from-fixture", str(flow / "nada.json"))
+    assert code == 1 and "no existe" in out
+
+
+def test_pipeline_from_fixture_runs_full_flow_offline(
+    flow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def in_process(cmd: list[str]) -> int:
+        calls.append(cmd)
+        return runner.invoke(app, cmd).exit_code
+
+    monkeypatch.setattr("odds_scanner.cli._run_subcommand", in_process)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(url__startswith=BASE_URL)
+        code, out = invoke("pipeline", "--from-fixture", str(REAL))
+    assert code == 0, out
+    assert not route.called
+    assert [c[0] for c in calls] == ["scan", "rank", "export"]
+    assert calls[0] == ["scan", "--from-fixture", str(REAL), "--yes"]
+    assert "0 consultas" in out and "corrida completa" in out
+    assert not (flow / "data" / "quota.json").exists()
+    exports = list((flow / "data" / "exports").glob("export_*/ranking.csv"))
+    assert len(exports) == 1
 
 
 def test_read_only_commands_do_not_create_ledger(workdir: Path) -> None:

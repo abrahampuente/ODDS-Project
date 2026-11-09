@@ -5,7 +5,7 @@
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from odds_scanner.client import Event
+from odds_scanner.exchanges import DEFAULT_COMMISSIONS
 from odds_scanner.normalize import normalize_events
 from odds_scanner.rank import RankedOutcome, summarize_markets
 
@@ -144,15 +145,16 @@ def closing_best_price(
     line: float | None,
     selection: str,
     commence_time: datetime,
+    commissions: Mapping[str, float] = DEFAULT_COMMISSIONS,
 ) -> float | None:
-    """Mejor cuota del resultado en la última captura previa al inicio (cierre)."""
+    """Mejor cuota efectiva del resultado en la última captura previa al inicio (cierre)."""
     for capture in sorted(captures, key=lambda c: c.captured_at, reverse=True):
         if capture.captured_at > commence_time:
             continue
         events = [e for e in capture.events if e.id == event_id]
         if not events:
             continue
-        for summary in summarize_markets(normalize_events(events).rows):
+        for summary in summarize_markets(normalize_events(events, commissions).rows):
             if (summary.market, summary.line) != (market, line):
                 continue
             try:

@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -89,14 +90,35 @@ def test_rule1_reset_requires_confirm(ready: Ledger) -> None:
 
 
 def test_rule1_reset_with_confirm_restarts_but_keeps_audit(ready: Ledger) -> None:
-    bet_id = bet(ready, 1, 10_000, 2.0)
-    ready.settle(bet_id, "lost")
+    ready.merge(1, [2])  # sin apuestas el reinicio no agrega dinero: solo deshace el merge
     pots = ready.init(reset=True, confirm=True)
     assert sum(p.balance for p in pots) == 100_000
-    assert ready.bets() == []
+    assert [p.status for p in pots] == ["active"] * 4
     actions = [e.action for e in ready.log()]
     assert actions.count("init") == 2
-    assert "reset" in actions and "bet" in actions  # la auditoría no se borra
+    assert "reset" in actions and "merge" in actions  # la auditoría no se borra
+
+
+@pytest.mark.parametrize("outcome", [None, "lost", "won", "void"])
+def test_rule1_reset_rejected_once_bets_exist(ready: Ledger, outcome: str | None) -> None:
+    """Auditoría fase 9: reiniciar con apuestas registradas equivale a una recarga."""
+    bet_id = bet(ready, 1, 10_000, 2.0)
+    if outcome is not None:
+        ready.settle(bet_id, outcome)
+    before = [(p.id, p.balance, p.status) for p in ready.pots()]
+    with pytest.raises(RuleViolationError, match="recarga"):
+        ready.init(reset=True, confirm=True)
+    assert [(p.id, p.balance, p.status) for p in ready.pots()] == before
+    assert [b.id for b in ready.bets()] == [bet_id]
+
+
+def test_rule1_reset_rejected_after_goal_or_budget_exhausted(ready: Ledger) -> None:
+    for pot in (1, 2, 3, 4):
+        ready.settle(bet(ready, pot, 25_000, 2.0), "lost")
+    assert ready.state().status == BUDGET_EXHAUSTED
+    with pytest.raises(RuleViolationError, match="recarga"):
+        ready.init(reset=True, confirm=True)
+    assert ready.state().status == BUDGET_EXHAUSTED
 
 
 # --- regla 2: sin recargas ----------------------------------------------------
@@ -137,6 +159,15 @@ def test_rule3_pending_bets_reduce_available_balance(ready: Ledger) -> None:
 def test_rule3_rejects_invalid_stake_or_odds(ready: Ledger, stake: int, odds: float) -> None:
     with pytest.raises(RuleViolationError):
         bet(ready, 1, stake, odds)
+
+
+@pytest.mark.parametrize("odds", [1.0000001, 1.001, 1.009])
+def test_rule3_rejects_odds_below_minimum(ready: Ledger, odds: float) -> None:
+    """Auditoría fase 9: una cuota < 1.01 no puede dar ganancia y se mostraba como 1.00."""
+    with pytest.raises(RuleViolationError, match=r">= 1\.01"):
+        bet(ready, 1, 1_000, odds)
+    assert ready.pot(1).balance == POT_INITIAL
+    bet(ready, 1, 1_000, 1.01)  # el mínimo sí se acepta
 
 
 def test_rule3_database_rejects_negative_balance(ready: Ledger, tmp_path: Path) -> None:
@@ -477,3 +508,111 @@ def test_failed_migration_rolls_back_completely(tmp_path: Path) -> None:
     conn.close()
     assert "nueva" not in tables  # el CREATE de la migración rota no quedó a medias
     assert max(versions) == SCHEMA_VERSION
+
+
+# --- concurrencia: dos procesos sobre la misma base (auditoría fase 9) -------
+
+
+def test_concurrent_settle_pays_only_once(
+    ready: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lee la apuesta como pendiente; antes de que escriba, otro proceso la liquida."""
+    bet_id = bet(ready, 1, 10_000, 2.0)
+    other = Ledger(tmp_path / "ledger.db")
+    original = Ledger.bet
+
+    def interleaved(self: Ledger, bid: int) -> object:
+        result = original(self, bid)
+        if self is ready and other.bet(bid).status == "pending":
+            other.settle(bid, "won")
+        return result
+
+    monkeypatch.setattr(Ledger, "bet", interleaved)
+    try:
+        with pytest.raises(RuleViolationError, match="ya fue liquidada"):
+            ready.settle(bet_id, "won")
+    finally:
+        other.close()
+    monkeypatch.undo()
+    assert ready.pot(1).balance == POT_INITIAL - 10_000 + 20_000
+    assert [e.action for e in ready.log()].count("settle") == 1
+
+
+def test_concurrent_bet_cannot_overdraw_pot(
+    ready: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valida el saldo; antes de que escriba, otro proceso gasta el pozo completo."""
+    other = Ledger(tmp_path / "ledger.db")
+    original = Ledger.check_bet
+
+    def interleaved(self: Ledger, pot_id: int, stake: int, odds: float) -> object:
+        result = original(self, pot_id, stake, odds)
+        if self is ready:
+            bet(other, pot_id, POT_INITIAL, 2.0)
+        return result
+
+    monkeypatch.setattr(Ledger, "check_bet", interleaved)
+    try:
+        with pytest.raises(RuleViolationError, match="saldo"):
+            bet(ready, 1, 10_000, 2.0)
+    finally:
+        other.close()
+    monkeypatch.undo()
+    assert ready.pot(1).balance == 0
+    assert len(ready.bets()) == 1
+
+
+def test_concurrent_bet_blocks_merge_of_source_pot(
+    ready: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valida el merge; antes de que escriba, otro proceso apuesta en el pozo de origen."""
+    other = Ledger(tmp_path / "ledger.db")
+    original = Ledger._pending_stake
+    fired: list[bool] = []
+
+    def interleaved(self: Ledger, pot_id: int | None = None) -> int:
+        result = original(self, pot_id)
+        if self is ready and pot_id == 2 and not fired:
+            fired.append(True)
+            bet(other, 2, 5_000, 2.0)
+        return result
+
+    monkeypatch.setattr(Ledger, "_pending_stake", interleaved)
+    try:
+        with pytest.raises(RuleViolationError, match="pozo 2"):
+            ready.merge(1, [2])
+    finally:
+        other.close()
+    monkeypatch.undo()
+    assert fired
+    assert (ready.pot(1).balance, ready.pot(1).status) == (POT_INITIAL, "active")
+    assert (ready.pot(2).balance, ready.pot(2).status) == (POT_INITIAL - 5_000, "active")
+    assert "merge" not in [e.action for e in ready.log()]
+
+
+def test_failed_migration_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auditoría fase 9: si la migración falla, la conexión no queda abierta (ResourceWarning)."""
+    import odds_scanner.ledger as ledger_module
+
+    path = tmp_path / "leak.db"
+    with Ledger(path) as lg:
+        lg.init()
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(
+        ledger_module, "MIGRATIONS", [*ledger_module.MIGRATIONS, (99, "ESTO NO ES SQL;")]
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        Ledger(path)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")

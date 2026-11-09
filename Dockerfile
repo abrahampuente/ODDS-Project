@@ -1,29 +1,34 @@
 # syntax=docker/dockerfile:1
-# Imagen de odds-scanner. La API key NUNCA se copia: llega como variable de
-# entorno en tiempo de ejecución (env_file en docker-compose). data/ es un volumen.
+# Imagen de odds-scanner sobre Chainguard (Wolfi), mínima y sin shell.
+# La API key NUNCA se copia: llega como variable de entorno en tiempo de ejecución
+# (env_file en docker-compose). data/ es un volumen.
+#
+# Por qué no python:3.12-slim: sus paquetes base de Debian (util-linux, ncurses,
+# systemd, acl, perl) traían CVEs HIGH sin parche y el programa no los usa. El
+# runtime de Chainguard solo trae Python y sus librerías, sin apt, sin shell.
+# Reconstruye con `docker compose build --pull` para tomar parches nuevos.
 
-# --- etapa 1: construir la wheel ---------------------------------------------
-FROM python:3.12-slim AS build
+# --- etapa 1: instalar el paquete en un venv (imagen -dev, con pip) -----------
+FROM cgr.dev/chainguard/python:latest-dev AS build
+USER root
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip wheel --wheel-dir /wheels .
+RUN python -m venv /app/venv \
+    && /app/venv/bin/pip install . \
+    && /app/venv/bin/pip uninstall --yes pip \
+    && mkdir -p /app/data
 
-# --- etapa 2: runtime mínimo, usuario no root --------------------------------
-FROM python:3.12-slim AS runtime
-ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-    PYTHONIOENCODING=utf-8
-# Aplica los parches de seguridad de Debian publicados después de la imagen base.
-RUN apt-get update     && apt-get upgrade --yes --no-install-recommends     && rm -rf /var/lib/apt/lists/*
-RUN groupadd --system --gid 10001 scanner \
-    && useradd --system --uid 10001 --gid scanner --home-dir /app --shell /usr/sbin/nologin scanner
-COPY --from=build /wheels /wheels
-RUN pip install /wheels/*.whl && rm -rf /wheels
+# --- etapa 2: runtime mínimo, usuario no root ---------------------------------
+# Misma etiqueta base que la etapa 1, así el venv y el intérprete coinciden.
+FROM cgr.dev/chainguard/python:latest AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 \
+    PATH="/app/venv/bin:$PATH"
 WORKDIR /app
-RUN mkdir -p /app/data && chown scanner:scanner /app/data
-USER scanner
+COPY --from=build /app/venv /app/venv
+COPY --from=build --chown=65532:65532 /app/data /app/data
+USER 65532:65532
 VOLUME ["/app/data"]
 ENTRYPOINT ["odds-scanner"]
 CMD ["pipeline"]

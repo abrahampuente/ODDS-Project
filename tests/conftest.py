@@ -14,6 +14,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Evita que variables reales del sistema contaminen los tests."""
     monkeypatch.delenv("ODDS_API_KEY", raising=False)
     monkeypatch.delenv("MIN_QUOTA_RESERVE", raising=False)
+    monkeypatch.delenv("EXCHANGE_COMMISSIONS", raising=False)
+    monkeypatch.delenv("SCHEDULE_MONTHLY_BUDGET", raising=False)
     yield
 
 

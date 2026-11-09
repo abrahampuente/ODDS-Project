@@ -1,6 +1,7 @@
 """Tests del módulo de matemática pura."""
 
 import math as pymath
+from itertools import combinations
 
 import pytest
 from hypothesis import given
@@ -11,8 +12,10 @@ from odds_scanner.math import (
     break_even_prob,
     expected_value,
     fair_probs,
+    fair_probs_power,
     implied_prob,
     margin,
+    net_odds,
     overround,
     target_odds,
 )
@@ -175,3 +178,82 @@ def test_property_fair_probs_sum_to_one(odds: list[float]) -> None:
 @given(odds_lists)
 def test_property_margin_at_least_minus_one(odds: list[float]) -> None:
     assert margin(odds) >= -1.0
+
+
+# --- fair_probs_power (corrige el sesgo favorito-longshot) --------------------
+
+
+def test_power_without_margin_returns_implied() -> None:
+    assert fair_probs_power([2.0, 2.0]) == pytest.approx([0.5, 0.5])
+    assert fair_probs_power([1.5, 3.0]) == pytest.approx([2 / 3, 1 / 3])  # overround exacto 1
+
+
+def test_power_sums_to_one_and_keeps_order() -> None:
+    probs = fair_probs_power([2.10, 3.40, 3.60])
+    assert sum(probs) == pytest.approx(1.0, abs=1e-9)
+    assert probs[0] > probs[1] > probs[2]
+
+
+def test_power_uses_a_single_exponent() -> None:
+    """p_i = implied_i ** k con el mismo k para todos los resultados."""
+    odds = [1.30, 5.00, 9.50]
+    probs = fair_probs_power(odds)
+    exponents = [pymath.log(p) / pymath.log(1 / o) for p, o in zip(probs, odds, strict=True)]
+    assert max(exponents) - min(exponents) < 1e-6
+    assert exponents[0] > 1.0  # con margen positivo, k > 1
+
+
+def test_power_gives_longshots_less_than_proportional() -> None:
+    odds = [1.30, 5.00, 9.50]  # margen ~7,4%
+    power, proportional = fair_probs_power(odds), fair_probs(odds)
+    assert power[2] < proportional[2]  # el no favorito ya no queda inflado
+    assert power[1] < proportional[1]
+    assert power[0] > proportional[0]
+
+
+def test_power_handles_negative_margin() -> None:
+    probs = fair_probs_power([2.10, 2.10])  # overround < 1
+    assert probs == pytest.approx([0.5, 0.5])
+
+
+def test_power_single_outcome_and_invalid() -> None:
+    assert fair_probs_power([1.5]) == [1.0]
+    with pytest.raises(ValueError):
+        fair_probs_power([])
+    with pytest.raises(ValueError):
+        fair_probs_power([2.0, 1.0])
+
+
+@given(odds_lists)
+def test_property_power_sums_to_one_and_keeps_order(odds: list[float]) -> None:
+    probs = fair_probs_power(odds)
+    assert pymath.isclose(sum(probs), 1.0, abs_tol=1e-9)
+    assert all(0.0 <= p <= 1.0 for p in probs)
+    assert len(probs) == len(odds)
+    # Todos los pares (no solo consecutivos): a menor cuota, mayor o igual probabilidad.
+    # El zip(strict=True) anterior comparaba listas de largo n y n-1 y fallaba siempre.
+    for (oa, pa), (ob, pb) in combinations(zip(odds, probs, strict=True), 2):
+        if oa < ob:
+            assert pa >= pb - 1e-12
+        elif ob < oa:
+            assert pb >= pa - 1e-12
+
+
+# --- net_odds (comisión de exchanges) -----------------------------------------
+
+
+def test_net_odds_discounts_commission_on_profit() -> None:
+    assert net_odds(3.0, 0.05) == pytest.approx(2.9)
+    assert net_odds(5.0, 0.02) == pytest.approx(4.92)
+    assert net_odds(2.0, 0.0) == 2.0
+
+
+@pytest.mark.parametrize("commission", [-0.01, 1.0, 1.5])
+def test_net_odds_rejects_invalid_commission(commission: float) -> None:
+    with pytest.raises(ValueError):
+        net_odds(2.0, commission)
+
+
+def test_net_odds_rejects_invalid_odds() -> None:
+    with pytest.raises(ValueError):
+        net_odds(1.0, 0.05)

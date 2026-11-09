@@ -1,14 +1,27 @@
 """Probabilidad justa por consenso de mercado y valor esperado (EV).
 
 Funciones puras sobre filas normalizadas; sin I/O.
+
+Por defecto el margen de cada casa se quita con el método power, que corrige el
+sesgo favorito-longshot: las casas cargan más margen a las cuotas altas, y el
+método proporcional les asigna una probabilidad justa demasiado alta (EV inflado
+justo en el rango de cuotas 4-6). El proporcional queda disponible con devig="proportional".
 """
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
-from odds_scanner.math import fair_probs, margin
+from odds_scanner.math import fair_probs, fair_probs_power, margin
 from odds_scanner.normalize import OddsRow
+
+DevigMethod = Literal["power", "proportional"]
+DEFAULT_DEVIG: DevigMethod = "power"
+_DEVIG: dict[str, Callable[[Sequence[float]], list[float]]] = {
+    "power": fair_probs_power,
+    "proportional": fair_probs,
+}
 
 MIN_BOOKS = 4
 SHARP_BOOKS = ("pinnacle",)  # referencia preferida; si no está, la casa de menor margen
@@ -48,11 +61,13 @@ def _by_book(rows: Sequence[OddsRow]) -> dict[str, dict[str, float]]:
     return books
 
 
-def _fair_by_outcome(prices: dict[str, float]) -> dict[str, float]:
-    return dict(zip(prices, fair_probs(list(prices.values())), strict=True))
+def _fair_by_outcome(prices: dict[str, float], devig: DevigMethod) -> dict[str, float]:
+    if devig not in _DEVIG:
+        raise ValueError(f"método de devig desconocido: {devig!r}")
+    return dict(zip(prices, _DEVIG[devig](list(prices.values())), strict=True))
 
 
-def consensus_from_group(rows: Sequence[OddsRow]) -> Consensus:
+def consensus_from_group(rows: Sequence[OddsRow], devig: DevigMethod = DEFAULT_DEVIG) -> Consensus:
     """Consenso para filas que ya pertenecen a un mismo evento+mercado+línea."""
     books = _by_book(rows)
     if not books:
@@ -61,7 +76,7 @@ def consensus_from_group(rows: Sequence[OddsRow]) -> Consensus:
     sharp_book = next((b for b in SHARP_BOOKS if b in books), None)
     if sharp_book is None:
         sharp_book = min(books, key=lambda b: (margin(list(books[b].values())), b))
-    sharp_probs = _fair_by_outcome(books[sharp_book])
+    sharp_probs = _fair_by_outcome(books[sharp_book], devig)
 
     if len(books) < MIN_BOOKS:
         return Consensus(len(books), None, sharp_book, sharp_probs)
@@ -69,7 +84,7 @@ def consensus_from_group(rows: Sequence[OddsRow]) -> Consensus:
     totals: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
     for prices in books.values():
-        for outcome, prob in _fair_by_outcome(prices).items():
+        for outcome, prob in _fair_by_outcome(prices, devig).items():
             totals[outcome] += prob
             counts[outcome] += 1
     averages = {o: totals[o] / counts[o] for o in totals}
@@ -79,11 +94,15 @@ def consensus_from_group(rows: Sequence[OddsRow]) -> Consensus:
 
 
 def consensus_fair_prob(
-    rows: Sequence[OddsRow], event_id: str, market: str, line: float | None = None
+    rows: Sequence[OddsRow],
+    event_id: str,
+    market: str,
+    line: float | None = None,
+    devig: DevigMethod = DEFAULT_DEVIG,
 ) -> Consensus:
     """Quita el margen a cada casa y promedia por resultado (requiere MIN_BOOKS casas)."""
     group = [r for r in rows if (r.event_id, r.market, r.line) == (event_id, market, line)]
-    return consensus_from_group(group)
+    return consensus_from_group(group, devig)
 
 
 def expected_value(best_price: float, fair_prob: float) -> float:
