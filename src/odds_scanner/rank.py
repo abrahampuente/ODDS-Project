@@ -1,4 +1,4 @@
-"""Resumen por evento+mercado+línea y ranking por margen combinado.
+"""Resumen por evento+mercado+línea y ranking por margen combinado o por EV.
 
 Funciones puras: reciben filas normalizadas y devuelven modelos; sin I/O.
 """
@@ -7,11 +7,15 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from odds_scanner.math import margin
 from odds_scanner.normalize import OddsRow
+from odds_scanner.value import consensus_from_group, expected_value, label_ev
+
+View = Literal["margin", "value"]
 
 ARBITRAGE_WARNING = (
     "Margen combinado negativo (posible arbitraje): casi siempre es una cuota "
@@ -47,6 +51,9 @@ class MarketSummary(BaseModel):
     best_prices: list[BestPrice]
     best_market_margin: float
     is_arbitrage: bool
+    fair_probs: dict[str, float] | None  # consenso sin margen; None si faltan casas
+    sharp_book: str | None
+    sharp_probs: dict[str, float] | None
 
     @property
     def n_books(self) -> int:
@@ -81,6 +88,12 @@ class RankedOutcome(BaseModel):
     book_margin: float
     best_market_margin: float
     is_arbitrage: bool
+    n_books: int
+    fair_prob: float | None
+    ev: float | None
+    label: str
+    sharp_book: str | None
+    sharp_prob: float | None
 
 
 @dataclass(frozen=True)
@@ -128,6 +141,7 @@ def summarize_markets(rows: Iterable[OddsRow]) -> list[MarketSummary]:
             for o, r in best.items()
         ]
         combined = margin([b.price for b in best_prices])
+        consensus = consensus_from_group(group)
         first = group[0]
         summaries.append(
             MarketSummary(
@@ -143,6 +157,9 @@ def summarize_markets(rows: Iterable[OddsRow]) -> list[MarketSummary]:
                 best_prices=best_prices,
                 best_market_margin=combined,
                 is_arbitrage=combined < 0,
+                fair_probs=consensus.fair_probs,
+                sharp_book=consensus.sharp_book,
+                sharp_probs=consensus.sharp_probs,
             )
         )
     return summaries
@@ -171,24 +188,39 @@ def rank(
     filters: RankFilters | None = None,
     *,
     now: datetime,
+    view: View = "margin",
 ) -> list[RankedOutcome]:
-    """Ranking de resultados ordenado por margen combinado ascendente (mejor primero)."""
+    """Ranking de resultados.
+
+    view="margin": margen combinado ascendente (mejor primero).
+    view="value": EV descendente; omite resultados sin EV (datos insuficientes).
+    """
+    if view not in ("margin", "value"):
+        raise ValueError(f"vista desconocida: {view!r}")
     f = filters or RankFilters()
-    ranked: list[tuple[tuple[float, datetime, str, str, float, int], RankedOutcome]] = []
+    ranked: list[tuple[tuple[float, float, datetime, str, str, float, int], RankedOutcome]] = []
     for s in summaries:
         if not _passes_group_filters(s, f, now):
             continue
         for index, best in enumerate(s.best_prices):
             if not _passes_odds_filter(best.price, f):
                 continue
+            fair = s.fair_probs[best.outcome] if s.fair_probs is not None else None
+            ev = expected_value(best.price, fair) if fair is not None else None
+            if view == "value" and ev is None:
+                continue
+            primary = -ev if view == "value" and ev is not None else s.best_market_margin
+            secondary = s.best_market_margin if view == "value" else 0.0
             key = (
-                s.best_market_margin,
+                primary,
+                secondary,
                 s.commence_time_utc,
                 s.event_id,
                 s.market,
                 s.line if s.line is not None else 0.0,
                 index,
             )
+            sharp = s.sharp_probs.get(best.outcome) if s.sharp_probs is not None else None
             ranked.append(
                 (
                     key,
@@ -208,6 +240,12 @@ def rank(
                         book_margin=s.margin_by_book[best.bookmaker],
                         best_market_margin=s.best_market_margin,
                         is_arbitrage=s.is_arbitrage,
+                        n_books=s.n_books,
+                        fair_prob=fair,
+                        ev=ev,
+                        label=label_ev(ev),
+                        sharp_book=s.sharp_book,
+                        sharp_prob=sharp,
                     ),
                 )
             )

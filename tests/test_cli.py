@@ -1,8 +1,10 @@
 """Tests de la CLI (version y doctor)."""
 
 import json
+import re
 from pathlib import Path
 
+import pytest
 import respx
 from typer.testing import CliRunner
 
@@ -158,7 +160,7 @@ def test_rank_warns_on_arbitrage() -> None:
     assert result.exit_code == 0, result.output
     table_rows = [line for line in result.output.splitlines() if "Jugador A - Jugador B" in line]
     assert len(table_rows) == 2
-    assert all(line.rstrip().endswith("ARB") for line in table_rows)  # marca en la fila
+    assert all(" ARB" in line for line in table_rows)  # marca en la fila de la tabla
     assert "desactualizada" in result.output
 
 
@@ -169,7 +171,7 @@ def test_rank_table_fits_120_columns() -> None:
     rows = [line for line in result.output.splitlines() if " h2h " in line]
     assert len(rows) == 15
     assert all(len(line.rstrip()) <= 120 for line in rows)
-    assert all(line.rstrip().endswith("ARB") for line in rows[:3])  # Chelsea-Leeds
+    assert all(" ARB" in line for line in rows[:3])  # Chelsea-Leeds
 
 
 def test_rank_applies_odds_filter() -> None:
@@ -186,8 +188,10 @@ def test_rank_applies_odds_filter() -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Jugador A" in result.output and "casa_uno" in result.output
-    assert "casa_dos" not in result.output
+    table_rows = [line for line in result.output.splitlines() if "Jugador A - Jugador B" in line]
+    assert len(table_rows) == 1  # solo Jugador A @ 2.20 cae en [2.15, 3]
+    assert "casa_uno" in table_rows[0] and "2.20" in table_rows[0]
+    assert "casa_dos" not in table_rows[0]
 
 
 def test_rank_missing_fixture_fails() -> None:
@@ -210,3 +214,59 @@ def test_rank_invalid_filters_fail() -> None:
         ],
     )
     assert result.exit_code == 1
+
+
+# --- vista value (fase 5) -----------------------------------------------------
+
+EV_DISCLAIMER_TEXT = (
+    "EV estimado con consenso de mercado. No garantiza ganancias; un EV "
+    "positivo aislado suele ser una cuota desactualizada."
+)
+
+
+def _rank_output(*extra: str) -> str:
+    result = runner.invoke(
+        app, ["rank", "--from-fixture", str(FIXTURES / "soccer_epl_2026-11-09.json"), *extra]
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+@pytest.mark.parametrize("view", ["margin", "value"])
+def test_rank_always_prints_ev_disclaimer(view: str) -> None:
+    output = _rank_output("--view", view)
+    assert " ".join(EV_DISCLAIMER_TEXT.split()) in " ".join(output.split())
+
+
+def test_rank_margin_view_has_ev_columns() -> None:
+    header = next(line for line in _rank_output().splitlines() if "cuota" in line)
+    for column in ("n", "p.justa", "EV", "etiqueta"):
+        assert column in header
+
+
+def test_rank_value_view_sorted_by_ev() -> None:
+    output = _rank_output("--view", "value", "--top", "60")
+    rows = [line for line in output.splitlines() if " h2h " in line]
+    assert len(rows) == 60
+    assert all(len(line.rstrip()) <= 120 for line in rows)
+    evs = [float(re.findall(r"([+-]\d+\.\d+)%", line)[-1]) for line in rows]
+    assert evs == sorted(evs, reverse=True)
+    assert "por EV" in output
+    assert any(label in rows[0] for label in ("revisar", "neutro", "evitar"))
+
+
+def test_rank_value_view_reports_insufficient() -> None:
+    result = runner.invoke(
+        app,
+        ["rank", "--from-fixture", str(FIXTURES / "synthetic_arbitrage.json"), "--view", "value"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "datos insuficientes" in result.output
+    assert "Top 0" in result.output
+
+
+def test_rank_rejects_unknown_view() -> None:
+    result = runner.invoke(
+        app, ["rank", "--from-fixture", str(FIXTURES / "synthetic_arbitrage.json"), "--view", "x"]
+    )
+    assert result.exit_code != 0
