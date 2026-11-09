@@ -1,0 +1,5 @@
+[
+  {"key": "soccer_epl", "group": "Soccer", "title": "EPL", "description": "English Premier League", "active": true, "has_outrights": false},
+  {"key": "soccer_chile_campeonato", "group": "Soccer", "title": "Primera División - Chile", "description": "Campeonato Chileno", "active": true, "has_outrights": false},
+  {"key": "golf_masters_tournament_winner", "group": "Golf", "title": "Masters Tournament Winner", "description": "2027 Winner", "active": true, "has_outrights": true}
+]

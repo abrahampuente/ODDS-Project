@@ -1,0 +1,62 @@
+[
+  {
+    "id": "e912304de2b2ce35b473ce2ecd3d1502",
+    "sport_key": "soccer_epl",
+    "sport_title": "EPL",
+    "commence_time": "2026-11-14T15:00:00Z",
+    "home_team": "Arsenal",
+    "away_team": "Chelsea",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-11-09T16:01:12Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-11-09T16:01:12Z",
+            "outcomes": [
+              {"name": "Arsenal", "price": 2.10},
+              {"name": "Chelsea", "price": 3.60},
+              {"name": "Draw", "price": 3.40}
+            ]
+          }
+        ]
+      },
+      {
+        "key": "betfair_ex_eu",
+        "title": "Betfair",
+        "last_update": "2026-11-09T16:00:40Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-11-09T16:00:40Z",
+            "outcomes": [
+              {"name": "Arsenal", "price": 2.14},
+              {"name": "Chelsea", "price": 3.75},
+              {"name": "Draw", "price": 3.50}
+            ]
+          },
+          {
+            "key": "h2h_lay",
+            "last_update": "2026-11-09T16:00:40Z",
+            "outcomes": [
+              {"name": "Arsenal", "price": 2.18},
+              {"name": "Chelsea", "price": 3.85},
+              {"name": "Draw", "price": 3.60}
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "sport_key": "soccer_epl",
+    "sport_title": "EPL",
+    "commence_time": "2026-11-15T17:30:00Z",
+    "home_team": "Liverpool",
+    "away_team": "Everton",
+    "bookmakers": []
+  }
+]

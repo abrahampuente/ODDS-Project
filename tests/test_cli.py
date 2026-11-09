@@ -1,11 +1,14 @@
 """Tests de la CLI (version y doctor)."""
 
+import json
 from pathlib import Path
 
+import respx
 from typer.testing import CliRunner
 
 from odds_scanner import __version__
 from odds_scanner.cli import app
+from odds_scanner.client import BASE_URL
 from odds_scanner.doctor import check_data_dir, check_python
 from tests.conftest import FAKE_KEY
 
@@ -59,3 +62,77 @@ def test_check_python_rejects_old_version() -> None:
 def test_check_data_dir_writable(tmp_path: Path) -> None:
     assert check_data_dir(tmp_path).ok
     assert not check_data_dir(tmp_path / "missing").ok
+
+
+# --- sports / fetch (fase 3) --------------------------------------------------
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+QUOTA_HEADERS = {"x-requests-remaining": "480", "x-requests-used": "20", "x-requests-last": "1"}
+
+
+def _write_env(workdir: Path) -> None:
+    (workdir / ".env").write_text(f"ODDS_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+
+
+def _seed_quota(workdir: Path, remaining: int) -> None:
+    (workdir / "data" / "quota.json").write_text(
+        json.dumps({"remaining": remaining, "used": 0, "last": 0, "updated_at": "x"}),
+        encoding="utf-8",
+    )
+
+
+def test_sports_lists_and_shows_quota(workdir: Path) -> None:
+    _write_env(workdir)
+    sports = json.loads((FIXTURES / "sample_sports.json").read_text(encoding="utf-8"))
+    with respx.mock:
+        respx.get(f"{BASE_URL}/v4/sports").respond(200, json=sports, headers=QUOTA_HEADERS)
+        result = runner.invoke(app, ["sports"])
+    assert result.exit_code == 0, result.output
+    assert "soccer_epl" in result.output
+    assert "480" in result.output  # restantes
+    assert FAKE_KEY not in result.output
+
+
+def test_fetch_records_and_reports_cost(workdir: Path) -> None:
+    _write_env(workdir)
+    _seed_quota(workdir, 500)
+    odds = json.loads((FIXTURES / "sample_odds_h2h.json").read_text(encoding="utf-8"))
+    with respx.mock:
+        respx.get(f"{BASE_URL}/v4/sports/soccer_epl/odds").respond(
+            200, json=odds, headers=QUOTA_HEADERS
+        )
+        result = runner.invoke(
+            app, ["fetch", "soccer_epl", "--regions", "eu", "--markets", "h2h", "--record"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Costo estimado: 1" in result.output
+    assert "Arsenal" in result.output
+    recorded = list((workdir / "fixtures").glob("soccer_epl_*.json"))
+    assert len(recorded) == 1
+    assert FAKE_KEY not in result.output
+
+
+def test_fetch_blocked_by_quota_guard(workdir: Path) -> None:
+    _write_env(workdir)
+    _seed_quota(workdir, 50)
+    with respx.mock:
+        route = respx.get(f"{BASE_URL}/v4/sports/soccer_epl/odds").respond(200, json=[])
+        result = runner.invoke(app, ["fetch", "soccer_epl"])
+    assert result.exit_code == 1
+    assert "reserva" in result.output.lower()
+    assert not route.called
+
+
+def test_fetch_without_key_fails_clearly(workdir: Path) -> None:
+    result = runner.invoke(app, ["fetch", "soccer_epl"])
+    assert result.exit_code == 1
+    assert "ODDS_API_KEY" in result.output
+
+
+def test_sports_with_invalid_key_fails_clearly(workdir: Path) -> None:
+    _write_env(workdir)
+    with respx.mock:
+        respx.get(f"{BASE_URL}/v4/sports").respond(401, json={"message": "invalid"})
+        result = runner.invoke(app, ["sports"])
+    assert result.exit_code == 1
+    assert "ODDS_API_KEY" in result.output
