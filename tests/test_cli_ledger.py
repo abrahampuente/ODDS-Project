@@ -20,7 +20,18 @@ def run(db: Path, *args: str) -> tuple[int, str]:
     return result.exit_code, result.output
 
 
-BET_ARGS = ["--event", "Chelsea vs Leeds", "--market", "h2h", "--bookmaker", "pinnacle"]
+# Fase 7: las apuestas manuales sin --market-odds tienen margen desconocido y piden
+# confirmación; en modo no interactivo eso exige --yes y --accept-high-margin.
+BET_ARGS = [
+    "--event",
+    "Chelsea vs Leeds",
+    "--market",
+    "h2h",
+    "--bookmaker",
+    "pinnacle",
+    "--yes",
+    "--accept-high-margin",
+]
 
 
 def test_init_status_and_repeat(db: Path) -> None:

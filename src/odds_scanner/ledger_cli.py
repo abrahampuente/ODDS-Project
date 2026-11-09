@@ -1,13 +1,20 @@
-"""Comandos `odds-scanner ledger ...` (I/O de consola sobre ledger.py)."""
+"""Comandos del ledger (I/O de consola sobre ledger.py).
 
+Se registran en el grupo `odds-scanner ledger ...` y también en el nivel superior
+(`odds-scanner bet`, `settle`, `merge`, `plan`, `status`, `init`, `log`).
+"""
+
+from collections.abc import Callable
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from odds_scanner import timeutil
 from odds_scanner.ledger import (
     DEFAULT_DB,
     GOAL,
@@ -17,11 +24,20 @@ from odds_scanner.ledger import (
     LedgerState,
     payout_for,
 )
+from odds_scanner.math import margin
+from odds_scanner.store import DEFAULT_DATA_DIR, load_last_rank
+
+MAX_MANUAL_MARGIN = 0.07
+RANK_MAX_AGE = timedelta(minutes=30)
 
 ledger_app = typer.Typer(
     no_args_is_help=True,
     help="Registro de los 4 pozos (solo registra; nunca coloca apuestas reales).",
 )
+
+DbOption = Annotated[
+    Path | None, typer.Option("--db", help="Ruta de la base SQLite (por defecto data/ledger.db).")
+]
 
 
 class SettleResult(StrEnum):
@@ -41,13 +57,23 @@ def _console() -> Console:
     return Console(width=120, highlight=False)
 
 
-def _open(ctx: typer.Context) -> Ledger:
-    db: Path = ctx.obj["db"]
-    return Ledger(db)
+def _db(ctx: typer.Context, db: Path | None) -> Path:
+    """--db del comando > --db del grupo `ledger` > data/ledger.db."""
+    if db is not None:
+        return db
+    group_db = ctx.obj.get("db") if isinstance(ctx.obj, dict) else None
+    if isinstance(group_db, Path):
+        return group_db
+    return DEFAULT_DB
 
 
 def _fail(message: str) -> typer.Exit:
     typer.echo(f"ERROR: {message}")
+    return typer.Exit(code=1)
+
+
+def _cancel() -> typer.Exit:
+    typer.echo("Cancelado: no se registró nada.")
     return typer.Exit(code=1)
 
 
@@ -81,9 +107,10 @@ def init(
     ctx: typer.Context,
     reset: Annotated[bool, typer.Option("--reset", help="Reinicia pozos y apuestas.")] = False,
     confirm: Annotated[bool, typer.Option("--confirm", help="Confirma el reinicio.")] = False,
+    db: DbOption = None,
 ) -> None:
-    """Crea los 4 pozos de 25.000 (solo una vez)."""
-    with _open(ctx) as ledger:
+    """Crea los 4 pozos de 25.000 (solo una vez; reiniciar exige --reset --confirm)."""
+    with Ledger(_db(ctx, db)) as ledger:
         try:
             ledger.init(reset=reset, confirm=confirm)
         except LedgerError as exc:
@@ -93,20 +120,146 @@ def init(
         _print_state(console, ledger.state())
 
 
+def _parse_market_odds(raw: str, odds: float) -> float:
+    try:
+        prices = [float(p) for p in raw.split(",") if p.strip()]
+        result = margin(prices)
+    except ValueError:
+        raise _fail("--market-odds debe ser una lista de cuotas > 1.0 separadas por coma") from None
+    if not any(abs(p - odds) < 1e-9 for p in prices):
+        raise _fail("--market-odds debe incluir la cuota ingresada en --odds")
+    return result
+
+
 @ledger_app.command()
 def bet(
     ctx: typer.Context,
     pot: Annotated[int, typer.Option(help="Pozo (1-4).")],
     stake: Annotated[int, typer.Option(help="Monto en CLP (entero).")],
-    odds: Annotated[float, typer.Option(help="Cuota decimal.")],
-    event: Annotated[str, typer.Option(help="Evento.")],
-    market: Annotated[str, typer.Option(help="Mercado (h2h, totals...).")],
-    selection: Annotated[str, typer.Option(help="Resultado elegido.")],
-    bookmaker: Annotated[str, typer.Option(help="Casa de apuestas.")],
+    row: Annotated[
+        int | None, typer.Option(help="Fila N del último ranking (rank/value/scan).")
+    ] = None,
+    odds: Annotated[float | None, typer.Option(help="Cuota decimal (entrada manual).")] = None,
+    event: Annotated[str | None, typer.Option(help="Evento (entrada manual).")] = None,
+    market: Annotated[str | None, typer.Option(help="Mercado (entrada manual).")] = None,
+    selection: Annotated[str | None, typer.Option(help="Resultado (entrada manual).")] = None,
+    bookmaker: Annotated[str | None, typer.Option(help="Casa (entrada manual).")] = None,
+    market_odds: Annotated[
+        str | None,
+        typer.Option(help="Todas las cuotas del mercado en esa casa, p. ej. 2.10,3.40,3.60."),
+    ] = None,
     notes: Annotated[str, typer.Option(help="Notas.")] = "",
+    yes: Annotated[bool, typer.Option("--yes", help="No pedir confirmación.")] = False,
+    accept_high_margin: Annotated[
+        bool,
+        typer.Option("--accept-high-margin", help="Con --yes, acepta margen > 7% o desconocido."),
+    ] = False,
+    db: DbOption = None,
+    data_dir: Annotated[Path, typer.Option(help="Directorio de datos.")] = DEFAULT_DATA_DIR,
 ) -> None:
-    """Registra una apuesta hecha por ti y descuenta el stake del pozo."""
-    with _open(ctx) as ledger:
+    """Registra una apuesta hecha por ti (no la coloca).
+
+    Debe salir de una fila del ranking (--row N). Si la ingresas a mano, se pide una
+    confirmación extra cuando el margen de la casa supera 7% o es desconocido. Antes de
+    registrar muestra pozo, stake, cuota, ganancia posible y la cuota necesaria según plan.
+    """
+    console = _console()
+    manual = {
+        "--odds": odds,
+        "--event": event,
+        "--market": market,
+        "--selection": selection,
+        "--bookmaker": bookmaker,
+    }
+    source: Literal["manual", "row"]
+    book_margin: float | None
+    ev: float | None = None
+    event_id: str | None = None
+    commence_time: str | None = None
+    line: float | None = None
+    fair_prob: float | None = None
+    if row is not None:
+        if any(v is not None for v in manual.values()) or market_odds is not None:
+            raise _fail("usa --row o los datos manuales (--odds, --event, ...), no ambos")
+        last = load_last_rank(data_dir)
+        if last is None:
+            raise _fail("no hay ranking guardado: ejecuta `rank`, `value` o `scan` antes de --row")
+        if not 1 <= row <= len(last.rows):
+            raise _fail(f"la fila {row} no existe en el último ranking ({len(last.rows)} filas)")
+        r = last.rows[row - 1]
+        now = timeutil.utcnow()
+        if r.commence_time_utc <= now:
+            raise _fail(f"el evento ya empezó ({r.commence_time_utc:%Y-%m-%d %H:%M} UTC)")
+        age = now - last.created_at
+        if age > RANK_MAX_AGE:
+            console.print(
+                f"ADVERTENCIA: el ranking tiene {int(age.total_seconds() // 60)} min; "
+                "confirma que la cuota sigue disponible."
+            )
+        odds, event, market = r.best_price, f"{r.home} vs {r.away}", r.market
+        selection, bookmaker = r.outcome, r.bookmaker
+        book_margin, ev, source = r.book_margin, r.ev, "row"
+        event_id, commence_time = r.event_id, r.commence_time_utc.isoformat()
+        line, fair_prob = r.line, r.fair_prob
+    else:
+        missing = [flag for flag, value in manual.items() if value is None]
+        if missing:
+            raise _fail(f"faltan {', '.join(missing)} (o usa --row N con una fila del ranking)")
+        assert odds is not None
+        book_margin = _parse_market_odds(market_odds, odds) if market_odds else None
+        source = "manual"
+    assert odds is not None and event and market and selection and bookmaker
+
+    with Ledger(_db(ctx, db)) as ledger:
+        try:
+            pot_info = ledger.check_bet(pot, stake, odds)
+        except LedgerError as exc:
+            raise _fail(str(exc)) from None
+        state, plan = ledger.state(), ledger.plan()
+        payout = payout_for(stake, odds)
+        needed = (GOAL - (state.total_balance - stake)) / stake
+        plan_entry = next((p for p in plan.per_pot if p.pot_id == pot), None)
+
+        console.print("Resumen de la apuesta (odds-scanner solo registra; no coloca apuestas):")
+        console.print(f"  Pozo: {pot} (saldo {clp(pot_info.balance)})")
+        console.print(f"  Stake: {clp(stake)}")
+        console.print(
+            f"  Cuota: {odds:.2f} en {bookmaker} ({'fila del ranking' if row else 'manual'})"
+        )
+        console.print(f"  Selección: {selection} | {event} | {market}")
+        console.print(f"  Pago si gana: {clp(payout)} | Ganancia posible: {clp(payout - stake)}")
+        console.print(
+            "  Margen de la casa: "
+            + ("desconocido" if book_margin is None else f"{book_margin:.2%}")
+        )
+        if ev is not None:
+            console.print(f"  EV estimado (consenso): {ev:+.2%}")
+        if plan_entry is not None:
+            console.print(
+                f"  Cuota necesaria según plan (pozo {pot}): {plan_entry.odds:.2f} "
+                f"(todo el saldo del pozo a una apuesta)"
+            )
+        console.print(
+            f"  Con este stake, para llegar a {clp(GOAL)} si gana necesitas cuota >= {needed:.2f}"
+        )
+        console.print(f"  ¿Llega a {clp(GOAL)} si gana?: {'sí' if odds >= needed else 'no'}")
+
+        if source == "manual" and (book_margin is None or book_margin > MAX_MANUAL_MARGIN):
+            reason = (
+                "margen desconocido (no se entregó --market-odds)"
+                if book_margin is None
+                else f"margen de la casa {book_margin:.2%} > 7%"
+            )
+            console.print(f"ADVERTENCIA: cuota ingresada a mano con {reason}.")
+            if yes and not accept_high_margin:
+                raise _fail("con --yes debes agregar --accept-high-margin para registrarla igual")
+            if not yes and not typer.confirm(
+                "¿Continuar con esta cuota igualmente?", default=False
+            ):
+                raise _cancel()
+        if not yes and not typer.confirm("¿Registrar esta apuesta?", default=False):
+            raise _cancel()
+
         try:
             placed = ledger.place_bet(
                 pot_id=pot,
@@ -117,16 +270,20 @@ def bet(
                 selection=selection,
                 bookmaker=bookmaker,
                 notes=notes,
+                book_margin=book_margin,
+                ev=ev,
+                source=source,
+                event_id=event_id,
+                commence_time=commence_time,
+                line=line,
+                fair_prob=fair_prob,
             )
         except LedgerError as exc:
             raise _fail(str(exc)) from None
-        console = _console()
         console.print(
-            f"Apuesta #{placed.id} registrada: pozo {pot}, {clp(stake)} a {odds} "
-            f"({selection} en {event}, {bookmaker}). Si gana paga {clp(payout_for(stake, odds))}."
+            f"Apuesta #{placed.id} registrada: pozo {pot}, {clp(stake)} a {odds:.2f}. "
+            f"Saldo del pozo {pot}: {clp(ledger.pot(pot).balance)}"
         )
-        console.print(f"Saldo del pozo {pot}: {clp(ledger.pot(pot).balance)}")
-        console.print("Recordatorio: odds-scanner solo registra; no coloca apuestas.")
 
 
 @ledger_app.command()
@@ -134,9 +291,10 @@ def settle(
     ctx: typer.Context,
     bet_id: Annotated[int, typer.Argument(help="Id de la apuesta.")],
     result: Annotated[SettleResult, typer.Argument(help="won, lost o void.")],
+    db: DbOption = None,
 ) -> None:
-    """Liquida una apuesta pendiente."""
-    with _open(ctx) as ledger:
+    """Liquida una apuesta pendiente: won suma stake x cuota, lost nada, void devuelve."""
+    with Ledger(_db(ctx, db)) as ledger:
         try:
             settled = ledger.settle(bet_id, result.value)
         except LedgerError as exc:
@@ -156,9 +314,10 @@ def merge(
     ctx: typer.Context,
     into: Annotated[int, typer.Argument(help="Pozo destino.")],
     sources: Annotated[list[int] | None, typer.Argument(help="Pozos de origen.")] = None,
+    db: DbOption = None,
 ) -> None:
-    """Junta el saldo de varios pozos activos en uno."""
-    with _open(ctx) as ledger:
+    """Junta el saldo de varios pozos activos en uno (los demás quedan merged)."""
+    with Ledger(_db(ctx, db)) as ledger:
         try:
             pot = ledger.merge(into, sources or [])
         except LedgerError as exc:
@@ -169,9 +328,9 @@ def merge(
 
 
 @ledger_app.command()
-def plan(ctx: typer.Context) -> None:
+def plan(ctx: typer.Context, db: DbOption = None) -> None:
     """Cuota necesaria para llegar a 500.000 con los saldos actuales."""
-    with _open(ctx) as ledger:
+    with Ledger(_db(ctx, db)) as ledger:
         result = ledger.plan()
         console = _console()
         console.print(result.message)
@@ -196,9 +355,9 @@ def plan(ctx: typer.Context) -> None:
 
 
 @ledger_app.command()
-def status(ctx: typer.Context) -> None:
+def status(ctx: typer.Context, db: DbOption = None) -> None:
     """Estado global, pozos y apuestas pendientes."""
-    with _open(ctx) as ledger:
+    with Ledger(_db(ctx, db)) as ledger:
         console = _console()
         state = ledger.state()
         _print_state(console, state)
@@ -219,13 +378,13 @@ def status(ctx: typer.Context) -> None:
                 )
             console.print(table)
         if state.status == IN_PROGRESS:
-            console.print("Siguiente paso: `ledger plan` para ver la cuota necesaria.")
+            console.print("Siguiente paso: `plan` para ver la cuota necesaria.")
 
 
 @ledger_app.command(name="log")
-def log_cmd(ctx: typer.Context) -> None:
+def log_cmd(ctx: typer.Context, db: DbOption = None) -> None:
     """Registro de auditoría (inmutable)."""
-    with _open(ctx) as ledger:
+    with Ledger(_db(ctx, db)) as ledger:
         console = _console()
         table = Table(title="events_log")
         for col in ("#", "fecha (UTC)", "acción", "detalle"):
@@ -234,3 +393,14 @@ def log_cmd(ctx: typer.Context) -> None:
             detail = ", ".join(f"{k}={v}" for k, v in entry.payload.items())
             table.add_row(str(entry.id), entry.created_at[:19], entry.action, detail)
         console.print(table)
+
+
+LEDGER_COMMANDS: dict[str, Callable[..., None]] = {
+    "init": init,
+    "bet": bet,
+    "settle": settle,
+    "merge": merge,
+    "plan": plan,
+    "status": status,
+    "log": log_cmd,
+}

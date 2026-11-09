@@ -74,8 +74,21 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX bets_status ON bets (status);
         """,
     ),
+    (
+        3,
+        """
+        ALTER TABLE bets ADD COLUMN event_id TEXT;
+        ALTER TABLE bets ADD COLUMN commence_time TEXT;
+        ALTER TABLE bets ADD COLUMN line REAL;
+        ALTER TABLE bets ADD COLUMN book_margin REAL;
+        ALTER TABLE bets ADD COLUMN fair_prob REAL;
+        ALTER TABLE bets ADD COLUMN ev REAL;
+        ALTER TABLE bets ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'
+            CHECK (source IN ('manual', 'row'));
+        """,
+    ),
 ]
-SCHEMA_VERSION = MIGRATIONS[-1][0]
+SCHEMA_VERSION = 3
 
 
 class LedgerError(RuntimeError):
@@ -113,6 +126,13 @@ class Bet:
     payout: int | None
     settled_at: str | None
     notes: str
+    event_id: str | None = None
+    commence_time: str | None = None
+    line: float | None = None
+    book_margin: float | None = None
+    fair_prob: float | None = None
+    ev: float | None = None
+    source: str = "manual"
 
 
 @dataclass(frozen=True)
@@ -203,7 +223,7 @@ class Ledger:
                 "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
             )
         current = self.schema_version()
-        for version, sql in MIGRATIONS:
+        for version, sql in MIGRATIONS:  # global: se lee en cada apertura
             if version <= current:
                 continue
             script = (
@@ -270,6 +290,13 @@ class Ledger:
             payout=r["payout"],
             settled_at=r["settled_at"],
             notes=r["notes"],
+            event_id=r["event_id"],
+            commence_time=r["commence_time"],
+            line=r["line"],
+            book_margin=r["book_margin"],
+            fair_prob=r["fair_prob"],
+            ev=r["ev"],
+            source=r["source"],
         )
 
     def log(self) -> list[LogEntry]:
@@ -345,19 +372,8 @@ class Ledger:
         if status in (GOAL_REACHED, BUDGET_EXHAUSTED):
             raise RuleViolationError(f"{status}: no se aceptan nuevas apuestas")
 
-    def place_bet(
-        self,
-        *,
-        pot_id: int,
-        stake: int,
-        odds: float,
-        event: str,
-        market: str,
-        selection: str,
-        bookmaker: str,
-        notes: str = "",
-    ) -> Bet:
-        """Registra una apuesta y descuenta el stake del saldo del pozo."""
+    def check_bet(self, pot_id: int, stake: int, odds: float) -> Pot:
+        """Valida una apuesta sin registrarla; lanza RuleViolationError si no procede."""
         self._require_betting_allowed()
         pot = self.pot(pot_id)
         if pot.status != "active":
@@ -370,10 +386,35 @@ class Ledger:
             raise RuleViolationError(
                 f"stake {stake} supera el saldo del pozo {pot_id} ({pot.balance})"
             )
+        return pot
+
+    def place_bet(
+        self,
+        *,
+        pot_id: int,
+        stake: int,
+        odds: float,
+        event: str,
+        market: str,
+        selection: str,
+        bookmaker: str,
+        notes: str = "",
+        event_id: str | None = None,
+        commence_time: str | None = None,
+        line: float | None = None,
+        book_margin: float | None = None,
+        fair_prob: float | None = None,
+        ev: float | None = None,
+        source: Literal["manual", "row"] = "manual",
+    ) -> Bet:
+        """Registra una apuesta y descuenta el stake del saldo del pozo."""
+        self.check_bet(pot_id, stake, odds)
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO bets (pot_ids, stake, odds, event, market, selection, bookmaker,"
-                " placed_at, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                " placed_at, status, notes, event_id, commence_time, line, book_margin,"
+                " fair_prob, ev, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     json.dumps([pot_id]),
                     stake,
@@ -384,6 +425,13 @@ class Ledger:
                     bookmaker,
                     self._now(),
                     notes,
+                    event_id,
+                    commence_time,
+                    line,
+                    book_margin,
+                    fair_prob,
+                    ev,
+                    source,
                 ),
             )
             self._conn.execute(
@@ -401,6 +449,7 @@ class Ledger:
                     "market": market,
                     "selection": selection,
                     "bookmaker": bookmaker,
+                    "source": source,
                 },
             )
         return self.bet(bet_id)

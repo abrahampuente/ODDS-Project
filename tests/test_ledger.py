@@ -391,3 +391,67 @@ def test_simulation_all_four_lose(ready: Ledger) -> None:
         bet(ready, 2, 1, 2.0)
     with pytest.raises(RuleViolationError, match="recargar"):
         ready.deposit(1, 25_000)
+
+
+# --- migración v3: contexto de la apuesta (fase 7) ----------------------------
+
+
+def test_bet_stores_context_fields(ready: Ledger) -> None:
+    placed = ready.place_bet(
+        pot_id=1,
+        stake=1_000,
+        odds=2.5,
+        event="A vs B",
+        market="totals",
+        selection="Over",
+        bookmaker="pinnacle",
+        event_id="ev1",
+        commence_time="2026-11-21T15:00:00+00:00",
+        line=2.5,
+        book_margin=0.031,
+        fair_prob=0.42,
+        ev=0.05,
+        source="row",
+    )
+    assert (placed.event_id, placed.line, placed.source) == ("ev1", 2.5, "row")
+    assert (placed.book_margin, placed.fair_prob, placed.ev) == (0.031, 0.42, 0.05)
+    assert placed.commence_time == "2026-11-21T15:00:00+00:00"
+
+
+def test_manual_bet_defaults(ready: Ledger) -> None:
+    placed = ready.bet(bet(ready, 1, 1_000, 2.0))
+    assert placed.source == "manual"
+    assert placed.event_id is None and placed.book_margin is None and placed.ev is None
+
+
+def test_check_bet_validates_without_writing(ready: Ledger) -> None:
+    ready.check_bet(1, 25_000, 2.0)
+    with pytest.raises(RuleViolationError, match="saldo"):
+        ready.check_bet(1, 25_001, 2.0)
+    assert ready.bets() == [] and [e.action for e in ready.log()] == ["init"]
+
+
+def test_v2_database_is_migrated_to_v3(tmp_path: Path) -> None:
+    import odds_scanner.ledger as ledger_module
+
+    path = tmp_path / "old.db"
+    original = ledger_module.MIGRATIONS
+    try:
+        ledger_module.MIGRATIONS = original[:2]
+        with Ledger(path) as old:
+            old.init()
+            assert old.schema_version() == 2
+        conn = sqlite3.connect(path)  # apuesta escrita con el esquema v2 (sin columnas nuevas)
+        conn.execute(
+            "INSERT INTO bets (pot_ids, stake, odds, event, market, selection, bookmaker,"
+            " placed_at, status) VALUES ('[1]', 1000, 2.0, 'A vs B', 'h2h', 'A', 'casa',"
+            " '2026-11-09T12:00:00+00:00', 'pending')"
+        )
+        conn.commit()
+        conn.close()
+    finally:
+        ledger_module.MIGRATIONS = original
+    with Ledger(path) as new:
+        assert new.schema_version() == 3
+        [existing] = new.bets()
+        assert existing.source == "manual" and existing.stake == 1_000
